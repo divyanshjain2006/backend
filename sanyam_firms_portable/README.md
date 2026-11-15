@@ -16,11 +16,11 @@ The system is designed around scientific traceability: a satellite detection is 
 |---|---|---|---|---|
 | FIRMS CSV | MODIS active fire | Terra / Aqua | CSV | FIRMS product feed |
 | FIRMS CSV | VIIRS active fire | Suomi-NPP / NOAA-20 / NOAA-21 | CSV | FIRMS product feed |
-| LAADS Level-2 | `MOD14` | Terra | HDF4 | `061` / C6.1 |
-| LAADS Level-2 | `MYD14` | Aqua | HDF4 | `061` / C6.1 |
-| LAADS Level-2 | `VNP14IMG` | Suomi-NPP | NetCDF4 / HDF5 | `002` / C2 |
-| LAADS Level-2 | `VJ114IMG` | NOAA-20 | NetCDF4 / HDF5 | `002` / C2 |
-| LAADS Level-2 | `VJ214IMG` | NOAA-21 | NetCDF4 / HDF5 | `002` / C2 |
+| LAADS Level-2 | `MOD14` | Terra | HDF4 | filename collection `061`; LAADS ArchiveSet `61` |
+| LAADS Level-2 | `MYD14` | Aqua | HDF4 | filename collection `061`; LAADS ArchiveSet `61` |
+| LAADS Level-2 | `VNP14IMG` | Suomi-NPP | NetCDF4 / HDF5 | filename collection `002`; LAADS ArchiveSet `5200` |
+| LAADS Level-2 | `VJ114IMG` | NOAA-20 | NetCDF4 / HDF5 | filename collection `002`; LAADS ArchiveSet `5200` |
+| LAADS Level-2 | `VJ214IMG` | NOAA-21 | NetCDF4 / HDF5 | filename collection `002`; LAADS ArchiveSet `5200` |
 
 The FIRMS ingestion implementation remains in `firms_ingest.py`. LAADS support is added in `laads_ingest.py`. Both adapters insert observations into the same repository schema.
 
@@ -274,7 +274,9 @@ python laads_ingest.py ingest \
   --bbox 73,26,78,30
 ```
 
-The LAADS client uses the configured product collection and date/bbox query, authorizes with the Earthdata bearer token, streams downloads to a temporary `.part` file and atomically renames a completed file. Credentials are never embedded in source code.
+The LAADS client uses the product ID, LAADS **ArchiveSet**, UTC date range and bbox, authorizes with the Earthdata bearer token, streams downloads to a temporary `.part` file and atomically renames a completed file. Credentials are never embedded in source code.
+
+**Do not confuse the filename collection with the LAADS ArchiveSet filter.** MOD14/MYD14 filenames use collection `061` and belong to ArchiveSet `61`. VIIRS VNP14IMG/VJ114IMG/VJ214IMG filenames use collection `002`, but their LAADS archive path and query filter use ArchiveSet `5200`. The API request therefore sends `archiveSets=61` or `archiveSets=5200`; it does not send `collections=002`. NASA lists the VIIRS products under ArchiveSet 5200 and the MODIS products under ArchiveSet 61. See [VNP14IMG product metadata](https://ladsweb.modaps.eosdis.nasa.gov/missions-and-measurements/products/VNP14IMG/), [MOD14 product metadata](https://ladsweb.modaps.eosdis.nasa.gov/missions-and-measurements/products/MOD14/) and the [LAADS API-V2 archive parameter specification](https://ladsweb.modaps.eosdis.nasa.gov/tools-and-services/api-v2/specs/).
 
 ### Raw archive layout
 
@@ -299,6 +301,19 @@ Existing destination granules are not downloaded over. `raw_assets` records the 
 - Pixel-level time is marked `LINEAR_INTERPOLATED_FROM_GRANULE_TIME_BOUNDS` when interpolated from the line position and granule start/end metadata. Where there are insufficient bounds it is marked `GRANULE_START_ONLY`; neither status should be presented as a native per-pixel UTC timestamp.
 
 The HDF4 reader selects each SDS by name and reads datasets independently. An unreadable **optional** SDS is skipped with an `HDF4_SDS_READ_FAILED` provenance warning retained in observation native attributes; this avoids discarding a usable granule because a non-essential diagnostic layer cannot be decoded. The `fire mask` SDS is mandatory, and the adapter rejects the granule if it is missing or unreadable. If `FirePix` is nonzero, the `FP_line`, `FP_sample`, `FP_latitude` and `FP_longitude` vectors are also mandatory and must contain enough rows to locate every sparse fire-pixel record. A missing required field is a granule error, never an empty/no-fire result.
+
+Some MODIS granules can declare zero-length one-dimensional `FP_*` SDS vectors when there are no fire-pixel table entries. `pyhdf` may raise `SDreaddata failure` if `.get()` is called on a zero-length SDS. SANYAM now checks the dimensions reported by `handle.datasets()` first: if a vector is explicitly zero-length, it creates a typed empty NumPy array and records its name in `_EMPTY_SDS_NAMES`. This is treated as a zero-row fire-pixel table only when metadata confirms zero length. If a required geolocation/index vector has non-zero or unknown dimensions and cannot be read, SANYAM rejects that granule rather than silently turning a read failure into a no-fire result. The full `fire mask` remains mandatory in all cases.
+
+### VIIRS memory-safe ingestion
+
+VIIRS 375 m granules can contain large full-swath arrays. The sparse ingestion path therefore:
+
+- Reads each NetCDF4/HDF5 variable only once (the former implementation evaluated `variable[...]` twice and could double peak memory for a variable).
+- Loads only the fire mask, algorithm QA, `FP_*` sparse detection vectors and explicitly named pixel-corner arrays needed by the observation adapter. Unrelated full-swath science arrays remain unchanged in the immutable raw file and are not materialized during sparse observation ingestion.
+- Does not allocate all decoded full-mask boolean layers during ingestion. The full decoder is deferred to swath-opportunity evaluation, where those classifications are actually needed.
+- Releases granule arrays and requests garbage collection before moving to the next granule.
+
+This is a memory reduction, not a substitute for sufficient memory when evaluating full-swath opportunity. On a constrained Codespace, ingest the VIIRS products in separate commands (one product at a time), beginning with a short date range. If the process is still terminated, inspect the Codespace memory limit and system OOM log before retrying a larger interval.
 
 If the HDF4 reader fails to import `pyhdf`, install the required native HDF4 system libraries and reinstall `pyhdf`. Do not work around a decoder failure by silently treating the source file as a CSV.
 
@@ -675,9 +690,23 @@ Install the system HDF4 development/runtime package for your Linux distribution,
 
 Check `DATABASE_URL`, database credentials/network access and that the user can create/use the required tables. For a local SQLite test, the project must be run from the repository root so `data/sanyam_firms.sqlite3` resolves as expected.
 
+### LAADS search returns HTTP 400
+
+Check that the query uses the correct LAADS ArchiveSet, not just the filename collection version. MOD14/MYD14 use ArchiveSet `61`; VNP14IMG/VJ114IMG/VJ214IMG use ArchiveSet `5200` even though the latter filenames contain `.002.`. SANYAM's current `laads_ingest.py` uses the documented `archiveSets` query parameter and keeps the filename collection ID separately for granule-name validation. The ingestion loop records a product-level search error and continues trying the remaining requested products; the final CLI exit code remains non-zero if any product failed.
+
+A 400 response containing a MODAPS reference number is returned in the per-product `errors` and `warnings` fields. Preserve that reference when contacting MODAPS Support. Do not paste your bearer token into an issue or log. If a query still fails after confirming ArchiveSet, test one product at a time and report its product ID, date range, bbox, HTTP status and MODAPS reference.
+
+### HDF4 logs `SDreaddata failure` for all `FP_*` vectors
+
+Check the dimension metadata before assuming file corruption. A zero-length `FP_*` vector can be a valid empty fire-pixel table: the current reader will create an empty array only if the HDF4 dataset metadata explicitly reports a zero dimension. If a required `FP_line`, `FP_sample`, `FP_latitude` or `FP_longitude` SDS has a non-zero or unknown dimension and cannot be read, the granule is rejected. Check the file itself with `file path/to/granule.hdf`, then inspect the SDS metadata using `handle.datasets()`; compare the fire-mask availability and any `FirePix` count. An unreadable fire mask always rejects the granule.
+
+### VIIRS LAADS ingestion process is terminated
+
+A shell message containing only `Terminated` means the process ended externally; on Codespaces this is often an operating-system or container memory kill, although the message alone does not prove the cause. Use the memory-safe sparse reader in the latest source: it reads each NetCDF variable once, skips unrelated full-swath variables and defers full decoded-mask boolean arrays during ingestion. Retry one product at a time with a one- or two-day period. Check resource usage with `free -h` and, where permitted, `dmesg -T | tail -n 50` or `cat /sys/fs/cgroup/memory.events`. Do not delete the raw `.nc` file; once it is fully downloaded, the next run can reuse it. If the process is killed again, record which product and granule was being processed and the cgroup memory events.
+
 ### LAADS request finds no granules
 
-Check product ID, collection, UTC date range, bbox order (`west,south,east,north`), token permissions and whether that product/platform delivered science granules for the period. A successful HTTP response containing no matching file is not itself an ingestion error.
+Check product ID, filename collection / ArchiveSet mapping, UTC date range, bbox order (`west,south,east,north`), token permissions and whether that product/platform delivered science granules for the period. A successful HTTP response containing no matching file is not itself an ingestion error.
 
 ### Export has no matching candidate links
 
@@ -714,7 +743,7 @@ SANYAM is a research and engineering system, not an operational fire-warning ser
 
 ### Latest local regression verification
 
-The current source snapshot passes 105 `unittest` cases, including HDF4 optional-SDS failure handling, required fire-mask rejection, required fire-pixel geolocation-vector validation, and deterministic missing-Earthdata-token API behavior. This remains mocked/local regression coverage; validate the five product families against authentic granules before scientific production use.
+The current source snapshot passes 111 `unittest` cases, including HDF4 zero-length fire-pixel vector handling, required non-empty geolocation-vector failure handling, required fire-mask rejection, LAADS ArchiveSet query construction, per-product search-failure isolation, and deterministic missing-Earthdata-token API behavior. This remains mocked/local regression coverage; validate the five product families against authentic granules before scientific production use.
 
 ---
 
@@ -748,7 +777,7 @@ python -c "import db, firms_ingest, laads_ingest, qc_and_opportunity, matching_a
 python -m unittest discover -s tests -v
 ```
 
-The current supplied source archive was locally verified with **105 passing `unittest` tests**. This is a baseline for that archive; run the commands above in your own Codespace to verify the files you actually extracted.
+The current supplied source archive was locally verified with **111 passing `unittest` tests**. This is a baseline for that archive; run the commands above in your own Codespace to verify the files you actually extracted.
 
 Run a single test module when diagnosing a failure:
 
@@ -780,6 +809,8 @@ python laads_ingest.py ingest --products VNP14IMG --start-date 2024-01-01 --end-
 python laads_ingest.py ingest --products VJ114IMG --start-date 2024-01-01 --end-date 2024-01-02 --bbox 73,26,78,30
 python laads_ingest.py ingest --products VJ214IMG --start-date 2024-01-01 --end-date 2024-01-02 --bbox 73,26,78,30
 ```
+
+Run these commands sequentially rather than requesting all three VIIRS platforms in one invocation on a memory-constrained Codespace. Each granule is cached under `data/raw/`, so subsequent runs reuse the downloaded file. `duplicates > 0` with `observations_inserted = 0` means the source-row hashes already exist in `observations`; verify the existing rows by `product_id` and `granule_id` before treating that as missing data.
 
 An archive search may legitimately return zero granules for a product/date/bbox. Check the returned JSON for the per-product status, discovered/downloaded counts, decoded observation count and rejection/error details. A successful mocked unit test is not proof that a live granule has been decoded correctly.
 

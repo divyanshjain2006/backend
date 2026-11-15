@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import gc
 import html.parser
 import json
 import logging
@@ -44,11 +45,11 @@ LOG = logging.getLogger("sanyam.laads_ingest")
 LAADS_BASE_URL = "https://ladsweb.modaps.eosdis.nasa.gov"
 LAADS_API_BASE = f"{LAADS_BASE_URL}/api/v2"
 PRODUCTS: dict[str, dict[str, Any]] = {
-    "MOD14": {"sensor": "MODIS", "platform": "Terra", "collection": "61", "ext": ".hdf", "instrument": "MODIS"},
-    "MYD14": {"sensor": "MODIS", "platform": "Aqua", "collection": "61", "ext": ".hdf", "instrument": "MODIS"},
-    "VNP14IMG": {"sensor": "VIIRS", "platform": "Suomi-NPP", "collection": "002", "ext": ".nc", "instrument": "VIIRS"},
-    "VJ114IMG": {"sensor": "VIIRS", "platform": "NOAA-20", "collection": "002", "ext": ".nc", "instrument": "VIIRS"},
-    "VJ214IMG": {"sensor": "VIIRS", "platform": "NOAA-21", "collection": "002", "ext": ".nc", "instrument": "VIIRS"},
+    "MOD14": {"sensor": "MODIS", "platform": "Terra", "collection": "61", "archive_set": "61", "ext": ".hdf", "instrument": "MODIS"},
+    "MYD14": {"sensor": "MODIS", "platform": "Aqua", "collection": "61", "archive_set": "61", "ext": ".hdf", "instrument": "MODIS"},
+    "VNP14IMG": {"sensor": "VIIRS", "platform": "Suomi-NPP", "collection": "002", "archive_set": "5200", "ext": ".nc", "instrument": "VIIRS"},
+    "VJ114IMG": {"sensor": "VIIRS", "platform": "NOAA-20", "collection": "002", "archive_set": "5200", "ext": ".nc", "instrument": "VIIRS"},
+    "VJ214IMG": {"sensor": "VIIRS", "platform": "NOAA-21", "collection": "002", "archive_set": "5200", "ext": ".nc", "instrument": "VIIRS"},
 }
 PLATFORM_ALIASES = {
     "TERRA": "Terra", "MOD": "Terra", "AQUA": "Aqua", "MYD": "Aqua",
@@ -200,7 +201,7 @@ class LAADSClient:
 
     def search_granules(
         self, *, product: str, collection: str, start_date: date, end_date: date,
-        bbox: Sequence[float],
+        bbox: Sequence[float], archive_set: str | None = None,
     ) -> list[str]:
         product = product.upper()
         if product not in PRODUCTS:
@@ -210,16 +211,29 @@ class LAADSClient:
         west, south, east, north = [float(v) for v in bbox]
         if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
             raise ValueError("invalid bbox west,south,east,north")
+        # `collection` in the granule filename (061 / 002) is not the same
+        # thing as LAADS' archiveSet identifier. For these products LAADS uses
+        # ArchiveSet 61 for MODIS C6.1 and ArchiveSet 5200 for VIIRS C2.
+        # The API documents `archiveSets` as a filter on /content/archives.
+        expected_collection = str(PRODUCTS[product]["collection"])
+        if str(collection).lstrip("0") != expected_collection.lstrip("0"):
+            raise ValueError(
+                f"{product} expects filename collection {expected_collection}, got {collection}"
+            )
+        selected_archive_set = str(archive_set or PRODUCTS[product]["archive_set"])
         params = {
             "products": product,
-            "collections": str(collection),
+            "archiveSets": selected_archive_set,
             "temporalRanges": f"{start_date.isoformat()}..{end_date.isoformat()}",
-            "regions": f"[BBOX]W{west} N{north} E{east} S{south}",
+            "regions": f"[BBOX]W{west:g} N{north:g} E{east:g} S{south:g}",
         }
         url = self.api_base + "/content/archives"
         response = self.session.get(url, params=params, timeout=(20, 120))
         if response.status_code >= 400:
-            raise LAADSError(f"LAADS search failed HTTP {response.status_code}: {response.text[:300]}")
+            raise LAADSError(
+                f"LAADS search failed for {product} (ArchiveSet {selected_archive_set}) "
+                f"HTTP {response.status_code}: {response.text[:500]}"
+            )
         parser = _AnchorParser()
         parser.feed(response.text)
         filenames: list[str] = []
@@ -376,7 +390,7 @@ def _normalise_fire_observation(
     end_at = _metadata_datetime(attrs, "end")
     if end_at and end_at < start_at:
         end_at = None
-    mask = _lookup(arrays, "fire mask")
+    mask = _lookup(arrays, "fire mask", "FireMask", "Fire_Mask")
     nlines = int(np.asarray(mask).shape[0]) if mask is not None and np.asarray(mask).ndim >= 2 else 0
     acquired_at, time_precision = _time_for_pixel(start_at, end_at, line, nlines)
     frp = _finite_float(field_values.get("FP_power"))
@@ -536,13 +550,36 @@ def decode_viirs_mask(fire_mask: Any, algorithm_qa: Any | None = None) -> dict[s
     }
 
 
-def _read_hdf4(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Read HDF4 SDS arrays while isolating unreadable optional datasets.
+def _hdf4_numpy_dtype(type_code: Any, sdc: Any) -> np.dtype:
+    """Map common HDF4 numeric types to NumPy dtypes for empty SDS arrays."""
+    candidates = (
+        ("INT8", np.int8), ("UINT8", np.uint8), ("CHAR8", np.int8),
+        ("UCHAR8", np.uint8), ("INT16", np.int16), ("UINT16", np.uint16),
+        ("INT32", np.int32), ("UINT32", np.uint32),
+        ("FLOAT32", np.float32), ("FLOAT64", np.float64),
+        ("INT64", np.int64), ("UINT64", np.uint64),
+    )
+    for constant_name, dtype in candidates:
+        constant = getattr(sdc, constant_name, None)
+        if constant is not None and int(constant) == int(type_code):
+            return np.dtype(dtype)
+    # There are no values in a zero-length array, so float64 is a safe
+    # neutral representation when the HDF4 numeric type is not recognized.
+    return np.dtype(np.float64)
 
-    A granule may expose SDS metadata entries whose data blocks cannot be read
-    by the local HDF4/pyhdf build. Optional layer failures are retained as
-    provenance warnings. The fire mask is mandatory: without it, the granule
-    cannot establish Level-2 mask evidence and must be rejected.
+
+def _read_hdf4(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read HDF4 SDS arrays, treating declared zero-length fire vectors as empty.
+
+    MOD14/MYD14 store the fire-pixel table as a set of 1-D SDS vectors. When a
+    granule has no fire detections, those vectors can have a zero-length shape;
+    pyhdf may raise SDreaddata failure when asked to read such an SDS. The SDS
+    metadata (including dimensions) is authoritative in that case, so create
+    a correctly shaped empty array without attempting a data read.
+
+    Non-empty unreadable optional layers are retained as warnings. The fire
+    mask is mandatory, and non-empty unreadable geolocation/index vectors must
+    not be silently treated as an empty fire table.
     """
     try:
         from pyhdf.SD import SD, SDC
@@ -552,18 +589,43 @@ def _read_hdf4(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         arrays: dict[str, Any] = {}
         read_warnings: list[dict[str, str]] = []
-        for name in handle.datasets():
+        empty_sds: list[str] = []
+        required_vectors = {"fp_line", "fp_sample", "fp_latitude", "fp_longitude"}
+        catalog = handle.datasets()
+        for name, descriptor in catalog.items():
             dataset = None
+            dims: tuple[int, ...] | None = None
+            type_code: Any = None
+            if isinstance(descriptor, (tuple, list)) and len(descriptor) >= 3:
+                try:
+                    dims = tuple(int(value) for value in descriptor[1])
+                    type_code = descriptor[2]
+                except (TypeError, ValueError):
+                    dims = None
+            if dims is not None and dims and any(size == 0 for size in dims):
+                arrays[name] = np.empty(dims, dtype=_hdf4_numpy_dtype(type_code, SDC))
+                empty_sds.append(str(name))
+                LOG.debug("HDF4 SDS %s in %s is declared zero-length; treating as empty", name, path.name)
+                continue
             try:
                 dataset = handle.select(name)
                 arrays[name] = dataset.get()
             except Exception as exc:
-                read_warnings.append({
+                warning = {
                     "code": "HDF4_SDS_READ_FAILED",
                     "dataset": str(name),
                     "message": f"Could not read HDF4 SDS {name!r}: {type(exc).__name__}: {exc}",
-                })
+                }
+                read_warnings.append(warning)
                 LOG.warning("Could not read HDF4 SDS %s from %s: %s", name, path.name, exc)
+                normalized_name = str(name).strip().lower().replace("_", " ")
+                if normalized_name in {item.replace("_", " ") for item in required_vectors}:
+                    # A failed non-empty (or dimension-unknown) required vector
+                    # means we cannot safely conclude the granule has no fires.
+                    raise LAADSError(
+                        f"Required MODIS fire-pixel SDS {name!r} is non-empty or has "
+                        "unknown dimensions but could not be read; refusing to classify this granule as zero-fire"
+                    ) from exc
             finally:
                 if dataset is not None:
                     endaccess = getattr(dataset, "endaccess", None)
@@ -587,16 +649,59 @@ def _read_hdf4(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         attrs = {key: _safe_scalar(value) for key, value in _native_attrs(handle.attributes()).items()}
         if read_warnings:
             attrs["_SDS_READ_WARNINGS"] = read_warnings
+        if empty_sds:
+            attrs["_EMPTY_SDS_NAMES"] = empty_sds
         return arrays, attrs
     finally:
         handle.end()
 
 
-def _read_hdf5(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _read_hdf5(path: Path, *, sparse_ingest: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read a VIIRS NetCDF4/HDF5 granule without duplicate materialization.
+
+    The previous implementation evaluated ``variable[...]`` twice for each
+    NetCDF variable (once to inspect ``filled`` and again to obtain data). On
+    large VIIRS swaths this temporarily doubled peak allocation. Read each SDS
+    exactly once. For sparse-observation ingestion, load only the fire mask,
+    algorithm QA, fire-pixel vectors and explicitly named corner arrays; other
+    science layers remain intact in the immutable raw granule on disk and can
+    be decoded later by a dedicated analysis path.
+    """
+    def wanted_variable(variable_name: str) -> bool:
+        if not sparse_ingest:
+            return True
+        base_name = str(variable_name).split("/")[-1]
+        normalized = base_name.strip().lower().replace("_", " ")
+        compact = normalized.replace(" ", "")
+        return (
+            compact in {"firemask", "algorithmqa"}
+            or normalized.startswith("fp ")
+            or compact.startswith("fp")
+            or normalized in {
+                "latitude corners", "longitude corners",
+                "pixel corner latitude", "pixel corner longitude",
+                "corner latitude", "corner longitude",
+            }
+        )
+
     try:
         import netCDF4
         with netCDF4.Dataset(path, "r") as dataset:
-            arrays = {name: variable[...].filled(np.nan) if hasattr(variable[...], "filled") else variable[...] for name, variable in dataset.variables.items()}
+            arrays: dict[str, Any] = {}
+            for name, variable in dataset.variables.items():
+                if not wanted_variable(name):
+                    continue
+                value = variable[...]
+                if np.ma.isMaskedArray(value):
+                    # Fill masked cells with NaN for floating data; integer
+                    # categorical layers retain their native dtype and use the
+                    # declared fill value only where masked.
+                    if np.issubdtype(value.dtype, np.floating):
+                        value = value.filled(np.nan)
+                    else:
+                        fill_value = getattr(variable, "_FillValue", None)
+                        value = value.filled(fill_value if fill_value is not None else 0)
+                arrays[name.split("/")[-1]] = np.asarray(value)
             attrs = {name: _safe_scalar(dataset.getncattr(name)) for name in dataset.ncattrs()}
             return arrays, attrs
     except ImportError:
@@ -613,8 +718,10 @@ def _read_hdf5(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     with h5py.File(path, "r") as handle:
         attrs = {key: _safe_scalar(value) for key, value in handle.attrs.items()}
         def visit(name: str, item: Any) -> None:
-            if isinstance(item, h5py.Dataset):
-                arrays[name.split("/")[-1]] = item[()]
+            if isinstance(item, h5py.Dataset) and wanted_variable(name):
+                # Materialize each selected HDF5 dataset once. Raw bytes remain
+                # preserved in the immutable granule file on disk.
+                arrays[name.split("/")[-1]] = np.asarray(item[()])
                 for key, value in item.attrs.items():
                     arrays.setdefault(f"{name.split('/')[-1]}__attr__{key}", _safe_scalar(value))
         handle.visititems(visit)
@@ -657,16 +764,19 @@ def _validate_fire_pixel_vectors(
     return expected_count
 
 
-def extract_modis_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *, product: str, granule: GranuleName) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def extract_modis_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *, product: str, granule: GranuleName, decode_full_mask: bool = True) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Pure array adapter used by pyhdf ingestion and mock-array unit tests."""
-    mask = _lookup(arrays, "fire mask")
+    mask = _lookup(arrays, "fire mask", "FireMask", "Fire_Mask")
     if mask is None:
         raise LAADSError("MODIS granule does not contain the required 'fire mask' SDS")
     mask = np.asarray(mask)
     if mask.ndim != 2:
         raise LAADSError("MODIS fire mask must be a 2D array")
-    qa = _lookup(arrays, "algorithm QA")
-    decoded = decode_modis_mask(mask, qa)
+    qa = _lookup(arrays, "algorithm QA", "AlgorithmQA", "Algorithm_QA")
+    # Full boolean mask layers are needed by the swath-opportunity workflow,
+    # not by sparse-detection ingestion. Avoid allocating many mask-sized
+    # boolean arrays during ordinary granule ingestion.
+    decoded = decode_modis_mask(mask, qa) if decode_full_mask else None
     fields = ["FP_line", "FP_sample", "FP_latitude", "FP_longitude", "FP_power", "FP_T21", "FP_T31", "FP_MeanT21", "FP_MeanT31", "FP_confidence", "FP_AdjCloud", "FP_day", "FP_SolZenAng", "FP_scan", "FP_track"]
     vectors = {field: _lookup(arrays, field) for field in fields}
     n = _validate_fire_pixel_vectors("MODIS", vectors, attrs)
@@ -690,16 +800,20 @@ def extract_modis_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *
     return rows, {"fire_mask": mask, "algorithm_qa": np.asarray(qa) if qa is not None else None, "decoded_mask": decoded}
 
 
-def extract_viirs_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *, product: str, granule: GranuleName) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def extract_viirs_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *, product: str, granule: GranuleName, decode_full_mask: bool = True) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Pure array adapter for VIIRS Collection 2 VNP14IMG/VJ114IMG/VJ214IMG."""
-    mask = _lookup(arrays, "fire mask")
+    mask = _lookup(arrays, "fire mask", "FireMask", "Fire_Mask")
     if mask is None:
         raise LAADSError("VIIRS granule does not contain the required 'fire mask' SDS")
     mask = np.asarray(mask)
     if mask.ndim != 2:
         raise LAADSError("VIIRS fire mask must be a 2D array")
-    qa = _lookup(arrays, "algorithm QA")
-    decoded = decode_viirs_mask(mask, qa)
+    qa = _lookup(arrays, "algorithm QA", "AlgorithmQA", "Algorithm_QA")
+    # The full decoder produces several mask-sized boolean layers. During
+    # sparse observation ingestion the native mask and QA are already retained
+    # in the immutable raw granule; defer classification until opportunity/QC
+    # requests it so a large VIIRS swath does not exhaust Codespace memory.
+    decoded = decode_viirs_mask(mask, qa) if decode_full_mask else None
     fields = ["FP_line", "FP_sample", "FP_latitude", "FP_longitude", "FP_power", "FP_T4", "FP_T5", "FP_MeanT4", "FP_MeanT5", "FP_AdjCloud", "FP_confidence", "FP_day", "FP_SolZenAng"]
     vectors = {field: _lookup(arrays, field) for field in fields}
     n = _validate_fire_pixel_vectors("VIIRS", vectors, attrs)
@@ -721,13 +835,20 @@ def extract_viirs_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *
     return rows, {"fire_mask": mask, "algorithm_qa": np.asarray(qa) if qa is not None else None, "decoded_mask": decoded}
 
 
-def _extract_file(path: Path, product: str, granule: GranuleName) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+def _extract_file(
+    path: Path, product: str, granule: GranuleName, *, decode_full_mask: bool = True,
+    sparse_ingest: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     if product in {"MOD14", "MYD14"}:
         arrays, attrs = _read_hdf4(path)
-        rows, mask_data = extract_modis_granule(arrays, attrs, product=product, granule=granule)
+        rows, mask_data = extract_modis_granule(
+            arrays, attrs, product=product, granule=granule, decode_full_mask=decode_full_mask,
+        )
     else:
-        arrays, attrs = _read_hdf5(path)
-        rows, mask_data = extract_viirs_granule(arrays, attrs, product=product, granule=granule)
+        arrays, attrs = _read_hdf5(path, sparse_ingest=sparse_ingest)
+        rows, mask_data = extract_viirs_granule(
+            arrays, attrs, product=product, granule=granule, decode_full_mask=decode_full_mask,
+        )
     return rows, mask_data, {**attrs, "_arrays": arrays}
 
 
@@ -764,10 +885,27 @@ def ingest_laads(
         if diag and diag[0]["code"] == "PLATFORM_OUT_OF_OPERATIONAL_RANGE":
             output["products"][product] = {"status": "SKIPPED_OUT_OF_OPERATIONAL_RANGE", "warnings": diag}
             continue
-        granule_urls = client.search_granules(
-            product=product, collection=spec["collection"], start_date=start_date,
-            end_date=end_date, bbox=bbox,
-        )
+        try:
+            granule_urls = client.search_granules(
+                product=product, collection=spec["collection"], archive_set=spec["archive_set"],
+                start_date=start_date, end_date=end_date, bbox=bbox,
+            )
+        except Exception as exc:
+            message = f"{product} discovery failed (ArchiveSet {spec['archive_set']}): {exc}"
+            LOG.exception("LAADS product search failed for %s", product)
+            output["products"][product] = {
+                "status": "FAILED", "archive_set": spec["archive_set"],
+                "filename_collection": spec["collection"], "granules_discovered": 0,
+                "granules_downloaded_or_cached": 0, "observations_inserted": 0,
+                "duplicates": 0, "rejected_granules": 0, "errors": [message],
+            }
+            output["warnings"].append({
+                "code": "LAADS_PRODUCT_SEARCH_FAILED", "product": product,
+                "archive_set": spec["archive_set"], "message": message,
+            })
+            # A failure for one product must not prevent other requested
+            # platforms/products from being discovered and ingested.
+            continue
         bbox_text = ",".join(str(float(v)) for v in bbox)
         ingestion_run_id = repository.create_run(
             dataset_id=f"LAADS_{product}_{spec['collection']}",
@@ -788,7 +926,10 @@ def ingest_laads(
                 checksum = sha256_file(destination)
                 byte_size = destination.stat().st_size
                 try:
-                    observations_from_file, masks, all_info = _extract_file(destination, product, granule)
+                    observations_from_file, masks, all_info = _extract_file(
+                        destination, product, granule, decode_full_mask=False,
+                        sparse_ingest=True,
+                    )
                     attrs = {k: v for k, v in all_info.items() if k != "_arrays"}
                     start_at = _metadata_datetime(attrs, "start") or granule.start_at
                     end_at = _metadata_datetime(attrs, "end")
@@ -830,6 +971,26 @@ def ingest_laads(
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
                 LOG.exception("Could not ingest LAADS granule %s", name)
+            finally:
+                # Release references to full swath arrays before opening the
+                # next granule. LAADS files remain immutable on disk, so this
+                # does not discard source evidence.
+                observations_from_file = None
+                masks = None
+                all_info = None
+                attrs = None
+                mask = None
+                observation_rows = None
+                gc.collect()
+                # Ask glibc to return freed NumPy buffers to the OS where
+                # available; this is optional and harmless on other runtimes.
+                try:
+                    import ctypes
+                    trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+                    if trim is not None:
+                        trim(0)
+                except Exception:
+                    pass
         status = "COMPLETED" if not errors else ("PARTIAL" if inserted or fetched else "FAILED")
         repository.finish_run(
             ingestion_run_id, status=status, fetched=fetched, inserted=inserted,

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-import laads_ingest as li
+import sanyam_firms_portable.laads_ingest as li
 from db import connect_db
 
 
@@ -49,6 +49,83 @@ class TestLAADSProductAndDecode(unittest.TestCase):
         self.assertEqual(set(decoded), set(arrays))
         np.testing.assert_array_equal(decoded["fire mask"], arrays["fire mask"])
         self.assertTrue(all(dataset.closed for dataset in datasets.values()))
+
+    def test_hdf4_reader_treats_zero_length_fire_pixel_vectors_as_empty(self):
+        class FakeDataset:
+            def __init__(self, value=None, should_fail=False):
+                self.value = value
+                self.should_fail = should_fail
+            def get(self):
+                if self.should_fail:
+                    raise ValueError("SDreaddata failure for zero-length SDS")
+                return self.value
+            def endaccess(self):
+                return None
+
+        fire_mask = np.array([[5, 5], [4, 5]], dtype=np.uint8)
+        names = ["FP_line", "FP_sample", "FP_latitude", "FP_longitude", "FP_power"]
+        datasets = {"fire mask": FakeDataset(fire_mask)}
+        datasets.update({name: FakeDataset(should_fail=True) for name in names})
+
+        class FakeSD:
+            def __init__(self, _path, _mode):
+                pass
+            def datasets(self):
+                result = {"fire mask": (0, (2, 2), 0, 0)}
+                result.update({name: (i + 1, (0,), 5, 0) for i, name in enumerate(names)})
+                return result
+            def select(self, name):
+                return datasets[name]
+            def attributes(self):
+                return {"FirePix": 0}
+            def end(self):
+                return None
+
+        fake_pyhdf = types.ModuleType("pyhdf")
+        fake_sd = types.ModuleType("pyhdf.SD")
+        fake_sd.SD = FakeSD
+        fake_sd.SDC = types.SimpleNamespace(READ=1, INT16=22, FLOAT32=5)
+        fake_pyhdf.SD = fake_sd
+        with patch.dict(sys.modules, {"pyhdf": fake_pyhdf, "pyhdf.SD": fake_sd}):
+            arrays, attrs = li._read_hdf4(Path("empty-fire-table.hdf"))
+        self.assertEqual(arrays["FP_line"].shape, (0,))
+        self.assertEqual(arrays["FP_latitude"].shape, (0,))
+        self.assertEqual(set(attrs["_EMPTY_SDS_NAMES"]), set(names))
+        self.assertNotIn("_SDS_READ_WARNINGS", attrs)
+        rows, _mask = li.extract_modis_granule(
+            arrays, attrs, product="MOD14",
+            granule=li.parse_granule_filename("MOD14.A2024001.0000.061.2024001000000.hdf"),
+        )
+        self.assertEqual(rows, [])
+
+    def test_hdf4_reader_does_not_hide_unreadable_nonempty_fire_vectors(self):
+        class FakeDataset:
+            def get(self):
+                raise ValueError("SDreaddata failure")
+            def endaccess(self):
+                return None
+        class FakeSD:
+            def __init__(self, _path, _mode):
+                pass
+            def datasets(self):
+                return {
+                    "fire mask": (0, (2, 2), 21, 0),
+                    "FP_line": (1, (3,), 22, 0),
+                }
+            def select(self, _name):
+                return FakeDataset()
+            def attributes(self):
+                return {"FirePix": 3}
+            def end(self):
+                return None
+        fake_pyhdf = types.ModuleType("pyhdf")
+        fake_sd = types.ModuleType("pyhdf.SD")
+        fake_sd.SD = FakeSD
+        fake_sd.SDC = types.SimpleNamespace(READ=1)
+        fake_pyhdf.SD = fake_sd
+        with patch.dict(sys.modules, {"pyhdf": fake_pyhdf, "pyhdf.SD": fake_sd}):
+            with self.assertRaisesRegex(li.LAADSError, "Required MODIS fire-pixel SDS 'FP_line'"):
+                li._read_hdf4(Path("bad-nonempty-vector.hdf"))
 
     def test_hdf4_reader_skips_unreadable_optional_sds_and_records_warning(self):
         arrays = {
@@ -123,8 +200,11 @@ class TestLAADSProductAndDecode(unittest.TestCase):
         self.assertEqual(set(li.PRODUCTS), {"MOD14", "MYD14", "VNP14IMG", "VJ114IMG", "VJ214IMG"})
         self.assertEqual(li.PRODUCTS["MOD14"]["collection"], "61")
         self.assertEqual(li.PRODUCTS["MYD14"]["collection"], "61")
+        self.assertEqual(li.PRODUCTS["MOD14"]["archive_set"], "61")
+        self.assertEqual(li.PRODUCTS["MYD14"]["archive_set"], "61")
         for product in ("VNP14IMG", "VJ114IMG", "VJ214IMG"):
             self.assertEqual(li.PRODUCTS[product]["collection"], "002")
+            self.assertEqual(li.PRODUCTS[product]["archive_set"], "5200")
 
     def test_parse_granule_filename_utc_and_collection(self):
         parsed = li.parse_granule_filename("MOD14.A2026320.1230.061.2026320123456.hdf")
@@ -209,6 +289,68 @@ class TestLAADSProductAndDecode(unittest.TestCase):
         }
         with self.assertRaisesRegex(li.LAADSError, "FP_longitude"):
             li.extract_modis_granule(arrays, {"FirePix": 1}, product="MOD14", granule=granule)
+
+    def test_viirs_ingest_mode_skips_full_decoded_boolean_mask_layers(self):
+        granule = li.parse_granule_filename("VNP14IMG.A2024001.0000.002.2024001000000.nc")
+        arrays = {
+            "fire mask": np.array([[7, 8], [9, 5]], dtype=np.uint8),
+            "algorithm QA": np.zeros((2, 2), dtype=np.uint32),
+            "FP_latitude": np.array([26.9, 27.0, 27.1]),
+            "FP_longitude": np.array([75.8, 75.9, 76.0]),
+            "FP_power": np.array([8.0, 12.0, 18.0]),
+            "FP_line": np.array([0, 0, 1]),
+            "FP_sample": np.array([0, 1, 0]),
+        }
+        rows, mask_data = li.extract_viirs_granule(
+            arrays, {"FirePix": 3}, product="VNP14IMG", granule=granule,
+            decode_full_mask=False,
+        )
+        self.assertEqual(len(rows), 3)
+        self.assertIsNone(mask_data["decoded_mask"])
+        np.testing.assert_array_equal(mask_data["fire_mask"], arrays["fire mask"])
+
+    def test_netcdf_sparse_reader_reads_each_variable_once_and_skips_unneeded_layers(self):
+        class FakeVariable:
+            def __init__(self, value):
+                self.value = value
+                self.reads = 0
+                self.dtype = value.dtype
+            def __getitem__(self, key):
+                self.reads += 1
+                return self.value
+
+        class FakeDataset:
+            def __init__(self):
+                self.variables = {
+                    "FireMask": FakeVariable(np.array([[5, 8]], dtype=np.uint8)),
+                    "Algorithm_QA": FakeVariable(np.zeros((1, 2), dtype=np.uint32)),
+                    "FP_line": FakeVariable(np.array([0], dtype=np.int16)),
+                    "FP_sample": FakeVariable(np.array([1], dtype=np.int16)),
+                    "FP_latitude": FakeVariable(np.array([27.0], dtype=np.float32)),
+                    "FP_longitude": FakeVariable(np.array([76.0], dtype=np.float32)),
+                    "FP_power": FakeVariable(np.array([10.0], dtype=np.float32)),
+                    "UnneededLargeTemperatureLayer": FakeVariable(np.ones((100, 100), dtype=np.float32)),
+                }
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def ncattrs(self):
+                return []
+            def getncattr(self, name):
+                raise KeyError(name)
+
+        fake_dataset = FakeDataset()
+        fake_netcdf4 = types.ModuleType("netCDF4")
+        fake_netcdf4.Dataset = lambda *_args, **_kwargs: fake_dataset
+        with patch.dict(sys.modules, {"netCDF4": fake_netcdf4}):
+            arrays, _attrs = li._read_hdf5(Path("mock.nc"), sparse_ingest=True)
+        self.assertIn("FireMask", arrays)
+        self.assertIn("FP_latitude", arrays)
+        self.assertNotIn("UnneededLargeTemperatureLayer", arrays)
+        self.assertEqual(fake_dataset.variables["FireMask"].reads, 1)
+        self.assertEqual(fake_dataset.variables["FP_latitude"].reads, 1)
+        self.assertEqual(fake_dataset.variables["UnneededLargeTemperatureLayer"].reads, 0)
 
     def test_viirs_array_adapter_retains_full_mask_and_fire_pixel_attributes(self):
         granule = li.parse_granule_filename("VNP14IMG.A2024001.0000.002.2024001000000.nc")
@@ -304,9 +446,34 @@ class TestLAADSClient(unittest.TestCase):
         self.assertEqual(session.headers["Authorization"], "Bearer example-download-token")
         params = session.calls[0][1]["params"]
         self.assertEqual(params["products"], "MOD14")
-        self.assertEqual(params["collections"], "61")
+        self.assertEqual(params["archiveSets"], "61")
+        self.assertNotIn("collections", params)
         self.assertEqual(params["temporalRanges"], "2024-01-01..2024-01-02")
         self.assertIn("[BBOX]", params["regions"])
+
+    def test_viirs_search_uses_archive_set_5200_not_filename_collection_002(self):
+        class FakeResponse:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"items": []}
+        class FakeSession:
+            def __init__(self):
+                self.headers = {}
+                self.calls = []
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return FakeResponse()
+        session = FakeSession()
+        client = li.LAADSClient("example-download-token", session=session)
+        client.search_granules(
+            product="VNP14IMG", collection="002", start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 5), bbox=[73, 26, 78, 30],
+        )
+        params = session.calls[0][1]["params"]
+        self.assertEqual(params["archiveSets"], "5200")
+        self.assertEqual(params["products"], "VNP14IMG")
+        self.assertNotIn("collections", params)
 
     def test_download_streams_to_part_file_then_atomically_renames(self):
         class FakeResponse:
@@ -349,6 +516,27 @@ class TestLAADSIngestionPersistence(unittest.TestCase):
     def tearDown(self):
         self.repository.close()
         self.tempdir.cleanup()
+
+    def test_search_failure_for_one_product_does_not_abort_remaining_products(self):
+        class FakeClient:
+            def __init__(self):
+                self.searched = []
+            def search_granules(self, **kwargs):
+                self.searched.append(kwargs["product"])
+                if kwargs["product"] == "MOD14":
+                    raise li.LAADSError("LAADS search failed HTTP 400: bad archive filter")
+                return []
+        client = FakeClient()
+        result = li.ingest_laads(
+            self.repository, client=client, products=["MOD14", "MYD14"],
+            start_date=date(2024, 1, 1), end_date=date(2024, 1, 1),
+            bbox=[73, 26, 78, 30], raw_root=self.root / "data" / "raw",
+        )
+        self.assertEqual(client.searched, ["MOD14", "MYD14"])
+        self.assertEqual(result["products"]["MOD14"]["status"], "FAILED")
+        self.assertEqual(result["products"]["MYD14"]["status"], "COMPLETED")
+        self.assertEqual(result["products"]["MYD14"]["granules_discovered"], 0)
+        self.assertEqual(result["warnings"][0]["code"], "LAADS_PRODUCT_SEARCH_FAILED")
 
     def test_ingestion_writes_immutable_raw_asset_and_observation_to_shared_schema(self):
         filename = "MOD14.A2024001.0000.061.2024001000000.hdf"
