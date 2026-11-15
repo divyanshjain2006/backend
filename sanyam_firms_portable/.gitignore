@@ -1,0 +1,36 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+
+# Satellite raw data
+data/raw/
+data/processed/
+data/cache/
+
+# Generated exports
+data/exports/
+
+# Temporary files
+*.part
+*.tmp
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
