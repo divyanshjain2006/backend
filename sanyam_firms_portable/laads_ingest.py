@@ -32,7 +32,7 @@ from urllib.parse import urljoin, urlparse
 import numpy as np
 import requests
 
-from sanyam_firms_portable.db import DatabaseRepository, connect_db
+from db import DatabaseRepository, connect_db
 
 try:
     from dotenv import load_dotenv

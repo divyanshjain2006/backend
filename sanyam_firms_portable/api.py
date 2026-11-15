@@ -21,22 +21,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from sanyam_firms_portable.db import DatabaseRepository, connect_db
-from sanyam_firms_portable.laads_ingest import (
+from db import DatabaseRepository, connect_db
+from laads_ingest import (
     LAADSClient,
     PRODUCTS,
     canonical_platform,
     ingest_laads,
     platform_availability_diagnostics,
 )
-from sanyam_firms_portable.matching_and_measurement import (
+from matching_and_measurement import (
     build_common_grid_summary,
     export_validation_geojson,
     run_baseline_matching,
     run_footprint_matching,
     analyze_frp_measurements,
 )
-from sanyam_firms_portable.qc_and_opportunity import (
+from qc_and_opportunity import (
     Level2SwathOpportunityProvider,
     evaluate_observation_opportunity,
     query_opportunity_summary,
@@ -361,7 +361,7 @@ def create_app(repository_factory: Callable[..., DatabaseRepository] = connect_d
                 start_at=start_at, end_at=end_at,
             )
             if platforms:
-                from sanyam_firms_portable.qc_and_opportunity import _platform_name
+                from qc_and_opportunity import _platform_name
                 allowed = {canonical_platform(x) for x in platforms}
                 rows = [r for r in rows if _platform_name(sensor, r.get("satellite")) in allowed]
             rows = rows[:limit]
@@ -380,7 +380,7 @@ def create_app(repository_factory: Callable[..., DatabaseRepository] = connect_d
             provider = None
             source_mode = "FIRMS"
             if request.evidence_mode == "LEVEL2":
-                from sanyam_firms_portable.laads_ingest import iter_level2_swaths_for_opportunity
+                from laads_ingest import iter_level2_swaths_for_opportunity
                 provider = Level2SwathOpportunityProvider(
                     iter_level2_swaths_for_opportunity(
                         repository, sensor=request.sensor, start_at=start_at, end_at=end_at,
