@@ -40,8 +40,8 @@ from shapely.strtree import STRtree
 from shapely.ops import transform as transform_geometry
 from shapely.wkt import loads as load_wkt
 
-from db import DatabaseRepository, connect_db
-from qc_and_opportunity import BoundingBox
+from sanyam_firms_portable.db import DatabaseRepository, connect_db
+from sanyam_firms_portable.qc_and_opportunity import BoundingBox
 
 try:
     from dotenv import load_dotenv
@@ -89,6 +89,80 @@ def _date_bounds(start_date: date | str, end_date: date | str) -> tuple[datetime
     start_at = datetime.combine(start_day, time.min, tzinfo=timezone.utc)
     end_at = datetime.combine(end_day + timedelta(days=1), time.min, tzinfo=timezone.utc)
     return start_at, end_at, start_day, end_day
+
+
+TEMPORAL_WINDOW_PRESETS = (5, 15, 30, 60, 120)
+
+
+def resolve_temporal_window(
+    *, window_preset: int | str | None = None,
+    temporal_window_minutes: float | None = None,
+    legacy_default: float = DEFAULT_TIME_DIFFERENCE_MINUTES,
+) -> tuple[float, str, int | None]:
+    """Resolve a named preset or 1..360 minute custom window."""
+    if window_preset is not None and temporal_window_minutes is not None:
+        raise ValueError("choose either window_preset or temporal_window_minutes, not both")
+    if window_preset is not None:
+        try:
+            preset = int(window_preset)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"window_preset must be one of {TEMPORAL_WINDOW_PRESETS}") from exc
+        if preset not in TEMPORAL_WINDOW_PRESETS:
+            raise ValueError(f"window_preset must be one of {TEMPORAL_WINDOW_PRESETS}")
+        return float(preset), "PRESET", preset
+    if temporal_window_minutes is not None:
+        custom = float(temporal_window_minutes)
+        if not math.isfinite(custom) or not 1.0 <= custom <= 360.0:
+            raise ValueError("custom temporal window must be between 1 and 360 minutes")
+        return custom, "CUSTOM", None
+    legacy = float(legacy_default)
+    if not math.isfinite(legacy) or legacy < 0 or legacy > 360:
+        raise ValueError("max_time_difference_minutes must be between 0 and 360")
+    return legacy, "LEGACY_DEFAULT_OR_FLAG", None
+
+
+def _platform_diagnostics(platforms: Sequence[str] | None, start_at: datetime | None, end_at: datetime | None) -> list[dict[str, str]]:
+    if not platforms or start_at is None or end_at is None:
+        return []
+    from sanyam_firms_portable.laads_ingest import platform_availability_diagnostics
+    return platform_availability_diagnostics(platforms, start_at, end_at)
+
+
+def _normalise_platforms(platforms: Sequence[str] | None) -> set[str] | None:
+    if not platforms:
+        return None
+    from sanyam_firms_portable.laads_ingest import canonical_platform
+    return {canonical_platform(value) for value in platforms}
+
+
+def _row_platform(row: Mapping[str, Any]) -> str:
+    from sanyam_firms_portable.qc_and_opportunity import _platform_name
+    return _platform_name(str(row.get("sensor") or ""), row.get("satellite"))
+
+
+def _within_window(value: Any, start_at: datetime | None, end_at: datetime | None) -> bool:
+    if start_at is None or end_at is None:
+        return True
+    instant = _utc(value)
+    return start_at <= instant < end_at
+
+
+def _pair_touches_query_window(
+    a: Mapping[str, Any], b: Mapping[str, Any],
+    start_at: datetime | None, end_at: datetime | None,
+) -> bool:
+    return _within_window(a["acquired_at"], start_at, end_at) or _within_window(b["acquired_at"], start_at, end_at)
+
+
+def _run_cache_key(configuration: Mapping[str, Any]) -> str:
+    stable = {
+        "selected_platforms": sorted(configuration.get("selected_platforms") or []),
+        "temporal_window_minutes": configuration.get("max_time_difference_minutes"),
+        "spatial_method": configuration.get("method"),
+        "grid_resolution_km": configuration.get("grid_resolution_km"),
+        "data_source_mode": configuration.get("data_source_mode", "BOTH"),
+    }
+    return hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _utc(value: Any) -> datetime:
@@ -240,9 +314,33 @@ class FIRMSScanTrackFootprintProvider:
         return approximate_firms_footprint(observation, context)
 
 
-# A future LAADS adapter can implement FootprintProvider with true geolocation
-# corner coordinates and set geometry_source = LEVEL2_GEOMETRY_SOURCE. No table
-# or GeoJSON contract change is required.
+class CompositeFootprintProvider:
+    """Prefer true LAADS pixel-corner WKT; explicitly fall back to FIRMS proxy."""
+
+    geometry_source = "MIXED_LEVEL2_AND_FIRMS_GEOMETRY"
+
+    def build_polygon(self, observation: Mapping[str, Any], context: EqualAreaContext) -> Polygon | None:
+        wkt = observation.get("footprint_wkt")
+        if wkt:
+            try:
+                geographic = load_wkt(str(wkt))
+                projected = transform_geometry(context.forward.transform, geographic)
+                if projected.is_valid and projected.area > 0:
+                    return projected if isinstance(projected, Polygon) else projected.convex_hull
+            except Exception:
+                LOG.warning("Invalid stored Level-2 footprint WKT for observation_id=%s", observation.get("observation_id"))
+        return approximate_firms_footprint(observation, context)
+
+    def source_for(self, row: Mapping[str, Any]) -> str:
+        if row.get("footprint_wkt") and row.get("footprint_source") == LEVEL2_GEOMETRY_SOURCE:
+            return LEVEL2_GEOMETRY_SOURCE
+        if _positive_scan_track(row):
+            return FIRMS_GEOMETRY_SOURCE
+        return POINT_FALLBACK_GEOMETRY_SOURCE
+
+
+# The provider only reports LEVEL2_PIXEL_CORNERS when explicit corner geometry
+# was ingested; it does not infer corners from sparse fire-pixel centres.
 
 
 def footprint_metrics(
@@ -274,18 +372,32 @@ def _filter_observations(
     end_at: datetime | None,
     bbox: BoundingBox | None,
     qc_processing_run_id: int | None,
+    platforms: Sequence[str] | None = None,
+    data_source_mode: str = "BOTH",
+    time_padding_minutes: float = 0.0,
 ) -> list[dict[str, Any]]:
+    fetch_start = start_at - timedelta(minutes=time_padding_minutes) if start_at is not None else None
+    fetch_end = end_at + timedelta(minutes=time_padding_minutes) if end_at is not None else None
     kwargs: dict[str, Any] = {
         "sensors": ("MODIS", "VIIRS"),
-        "start_at": start_at,
-        "end_at": end_at,
+        "start_at": fetch_start,
+        "end_at": fetch_end,
         "qc_processing_run_id": qc_processing_run_id,
         "require_matching_suitability": True,
+        "data_source_mode": data_source_mode,
     }
     if bbox is not None:
         kwargs.update(west=bbox.west, south=bbox.south, east=bbox.east, north=bbox.north)
     rows = repository.fetch_scientific_observations(**kwargs)
-    return [dict(row) for row in rows if row.get("sensor") in {"MODIS", "VIIRS"}]
+    selected_platforms = _normalise_platforms(platforms)
+    result = []
+    for row in rows:
+        if row.get("sensor") not in {"MODIS", "VIIRS"}:
+            continue
+        if selected_platforms and _row_platform(row) not in selected_platforms:
+            continue
+        result.append(dict(row))
+    return result
 
 
 def _pair_time_difference_minutes(a: Mapping[str, Any], b: Mapping[str, Any]) -> float:
@@ -420,6 +532,107 @@ def _matching_run_config(
     return config, json.dumps(config, sort_keys=True, separators=(",", ":"))
 
 
+def _attach_candidate_explanations(
+    records: list[dict[str, Any]], *, all_rows: Sequence[Mapping[str, Any]],
+    query_rows: Sequence[Mapping[str, Any]], max_time_difference_minutes: float,
+    max_distance_km: float | None = None,
+) -> None:
+    """Persist explainability, source provenance and one primary UTC day."""
+    by_id = {int(row["observation_id"]): row for row in all_rows}
+    query_ids = {int(row["observation_id"]) for row in query_rows}
+    component_times: dict[str, list[datetime]] = defaultdict(list)
+    for record in records:
+        m_id, v_id = record.get("modis_observation_id"), record.get("viirs_observation_id")
+        members = [by_id[int(value)] for value in (m_id, v_id) if value is not None and int(value) in by_id]
+        component = record.get("component_id")
+        if component and members:
+            component_times[str(component)].extend(_utc(member["acquired_at"]) for member in members)
+    for record in records:
+        m_id, v_id = record.get("modis_observation_id"), record.get("viirs_observation_id")
+        members = [by_id[int(value)] for value in (m_id, v_id) if value is not None and int(value) in by_id]
+        warnings: list[dict[str, str]] = []
+        if max_time_difference_minutes > 60:
+            warnings.append({
+                "code": "DIURNAL_DRIFT_WARNING",
+                "message": f"The {max_time_difference_minutes:g}-minute window may span meaningful changes in fire intensity between overpasses",
+            })
+        if m_id is not None and v_id is not None and len(members) == 2:
+            m_row = by_id[int(m_id)]
+            v_row = by_id[int(v_id)]
+            delta = float(record.get("time_difference_minutes") or 0.0)
+            if record.get("relationship_status") == "REJECTED":
+                reason = f"The pair was rejected because its time difference ({delta:.1f} minutes) or spatial criteria exceeded the configured limits."
+            elif record.get("matching_method") == "FOOTPRINT_AWARE" and record.get("smaller_footprint_overlap") is not None:
+                reason = (
+                    f"The MODIS and VIIRS pixel footprints overlap by {float(record['smaller_footprint_overlap']):.2f} "
+                    f"of the smaller footprint; Δt={delta:.1f} minutes."
+                )
+            else:
+                distance = record.get("centroid_distance_km")
+                reason = f"The pixel centres are {float(distance):.2f} km apart; Δt={delta:.1f} minutes."
+            times = component_times.get(str(record.get("component_id")), [_utc(x["acquired_at"]) for x in members])
+            earliest, latest = min(times), max(times)
+            cross_midnight = earliest.date() != latest.date()
+            primary_day = earliest.date().isoformat()
+            if cross_midnight:
+                reason += f" The association spans UTC midnight and is assigned once to {primary_day}."
+            provenance = []
+            for row in members:
+                try:
+                    raw = json.loads(str(row.get("raw_json") or "{}"))
+                except (ValueError, TypeError):
+                    raw = {}
+                provenance.append({
+                    "observation_id": row.get("observation_id"),
+                    "sensor": row.get("sensor"),
+                    "platform": _row_platform(row),
+                    "granule_id": row.get("granule_id"),
+                    "raw_asset_id": row.get("raw_asset_id"),
+                    "sha256": row.get("raw_asset_sha256"),
+                    "product_id": row.get("product_id"),
+                    "collection": row.get("collection"),
+                    "source_csv_path": raw.get("source_path") or raw.get("storage_path"),
+                    "dataset_id": row.get("dataset_id"),
+                    "geometry_source": row.get("footprint_source"),
+                    "acquired_at_utc": _utc(row["acquired_at"]).isoformat(),
+                })
+        else:
+            observation = members[0] if members else None
+            cross_midnight = False
+            primary_day = _utc(observation["acquired_at"]).date().isoformat() if observation else None
+            sensor = observation.get("sensor") if observation else "unknown"
+            reason = f"No opposite-sensor candidate satisfied the configured spatial and {max_time_difference_minutes:g}-minute temporal criteria for this {sensor} observation."
+            provenance = []
+            if observation:
+                try:
+                    raw = json.loads(str(observation.get("raw_json") or "{}"))
+                except (ValueError, TypeError):
+                    raw = {}
+                provenance = [{
+                    "observation_id": observation.get("observation_id"),
+                    "sensor": observation.get("sensor"), "platform": _row_platform(observation),
+                    "granule_id": observation.get("granule_id"), "raw_asset_id": observation.get("raw_asset_id"),
+                    "sha256": observation.get("raw_asset_sha256"), "product_id": observation.get("product_id"),
+                    "collection": observation.get("collection"),
+                    "source_csv_path": raw.get("source_path") or raw.get("storage_path"),
+                    "dataset_id": observation.get("dataset_id"),
+                    "geometry_source": observation.get("footprint_source"),
+                    "acquired_at_utc": _utc(observation["acquired_at"]).isoformat(),
+                }]
+        if warnings:
+            reason += " Diurnal-drift caution: temporal separation exceeds 60 minutes."
+        explanation = {
+            "reason_code": "CANDIDATE_ASSOCIATION" if m_id is not None and v_id is not None else "UNMATCHED_OBSERVATION",
+            "plain_language": reason,
+            "provenance": provenance,
+            "uncertainty_sources": ["geolocation", "granule timing precision", "temporal threshold", "spatial method", "observation opportunity"],
+            "warnings": warnings,
+        }
+        record["is_cross_midnight"] = bool(cross_midnight)
+        record["primary_calendar_day"] = primary_day
+        record["explanation_json"] = json.dumps(explanation, sort_keys=True, separators=(",", ":"))
+
+
 def run_baseline_matching(
     repository: DatabaseRepository,
     *,
@@ -430,10 +643,23 @@ def run_baseline_matching(
     max_time_difference_minutes: float = DEFAULT_TIME_DIFFERENCE_MINUTES,
     qc_processing_run_id: int | None = None,
     method_version: str = METHOD_VERSION,
+    platforms: Sequence[str] | None = None,
+    data_source_mode: str = "BOTH",
+    window_preset: int | str | None = None,
+    temporal_window_minutes: float | None = None,
+    grid_resolution_km: float | None = None,
 ) -> dict[str, Any]:
-    """Run baseline spherical-centroid Haversine/time candidate matching."""
-    if max_distance_km <= 0 or max_time_difference_minutes < 0:
-        raise ValueError("distance must be > 0 and time threshold must be >= 0")
+    """Run continuous-UTC centroid matching with padded query boundaries."""
+    max_time_difference_minutes, temporal_source, temporal_preset = resolve_temporal_window(
+        window_preset=window_preset, temporal_window_minutes=temporal_window_minutes,
+        legacy_default=max_time_difference_minutes,
+    )
+    if max_distance_km <= 0:
+        raise ValueError("distance must be > 0")
+    if grid_resolution_km is not None and grid_resolution_km not in {1.0, 2.0, 5.0}:
+        raise ValueError("grid_resolution_km must be 1.0, 2.0, 5.0, or None")
+    selected_platforms = sorted(_normalise_platforms(platforms) or [])
+    data_source_mode = data_source_mode.upper()
     box_value = BoundingBox.parse(bbox) if bbox is not None else None
     if (start_date is None) != (end_date is None):
         raise ValueError("start_date and end_date must be supplied together")
@@ -444,9 +670,12 @@ def run_baseline_matching(
 
     rows = _filter_observations(
         repository, start_at=start_at, end_at=end_at, bbox=box_value,
-        qc_processing_run_id=qc_processing_run_id,
+        qc_processing_run_id=qc_processing_run_id, platforms=platforms,
+        data_source_mode=data_source_mode, time_padding_minutes=max_time_difference_minutes,
     )
+    query_rows = [row for row in rows if _within_window(row["acquired_at"], start_at, end_at)]
     modis_rows, viirs_rows = _partition_by_sensor(rows)
+    diagnostics = _platform_diagnostics(platforms, start_at, end_at)
     config, config_json = _matching_run_config(
         method="BASELINE_HAVERSINE", method_version=method_version,
         bbox=box_value, max_time_difference_minutes=max_time_difference_minutes,
@@ -454,8 +683,18 @@ def run_baseline_matching(
         start_date=start_day.isoformat() if start_day else None,
         end_date=end_day.isoformat() if end_day else None,
         earth_radius_km=EARTH_RADIUS_KM,
+        selected_platforms=selected_platforms or ["ALL"], data_source_mode=data_source_mode,
+        grid_resolution_km=grid_resolution_km,
+        temporal_window_source=temporal_source, temporal_window_preset=temporal_preset,
+        query_start_utc=start_at.isoformat() if start_at else None,
+        query_end_utc=end_at.isoformat() if end_at else None,
+        padded_fetch_start_utc=(start_at - timedelta(minutes=max_time_difference_minutes)).isoformat() if start_at else None,
+        padded_fetch_end_utc=(end_at + timedelta(minutes=max_time_difference_minutes)).isoformat() if end_at else None,
+        platform_diagnostics=diagnostics,
     )
-    run_id = repository.create_processing_run("MATCHING", method_version, config_json)
+    config["run_cache_key"] = _run_cache_key(config)
+    config_json = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    run_id = repository.create_processing_run("MATCHING", method_version, config_json, run_cache_key=config["run_cache_key"])
     try:
         sorted_viirs = sorted(viirs_rows, key=lambda row: float(row["latitude"]))
         viirs_lats = [float(row["latitude"]) for row in sorted_viirs]
@@ -491,6 +730,8 @@ def run_baseline_matching(
                     "component_id": None,
                     "config_json": config_json,
                 }
+                if not _pair_touches_query_window(modis, viirs, start_at, end_at):
+                    continue
                 if time_diff <= max_time_difference_minutes:
                     edges.append(record)
                 else:
@@ -501,8 +742,13 @@ def run_baseline_matching(
             matched_nodes.add(("MODIS", int(edge["modis_observation_id"])))
             matched_nodes.add(("VIIRS", int(edge["viirs_observation_id"])))
         records = edges + rejected + _unmatched_records(
-            rows, matched_nodes, processing_run_id=run_id,
+            query_rows, matched_nodes, processing_run_id=run_id,
             matching_method="BASELINE_HAVERSINE", config_json=config_json,
+        )
+        _attach_candidate_explanations(
+            records, all_rows=rows, query_rows=query_rows,
+            max_time_difference_minutes=max_time_difference_minutes,
+            max_distance_km=max_distance_km,
         )
         inserted = repository.insert_candidate_associations(records)
         repository.finish_processing_run(
@@ -523,6 +769,13 @@ def run_baseline_matching(
         "output_records": inserted, "relationship_status_counts": dict(statuses),
         "max_distance_km": max_distance_km,
         "max_time_difference_minutes": max_time_difference_minutes,
+        "temporal_window_source": temporal_source,
+        "temporal_window_preset": temporal_preset,
+        "padded_fetch_observations": len(rows),
+        "requested_window_observations": len(query_rows),
+        "cross_midnight_candidate_count": sum(1 for item in records if item.get("is_cross_midnight")),
+        "warnings": ([{"code": "DIURNAL_DRIFT_WARNING", "message": "Temporal window >60 minutes may span material fire-intensity change"}] if max_time_difference_minutes > 60 else []) + diagnostics,
+        "run_cache_key": config["run_cache_key"],
         "status": "COMPLETED",
     }
 
@@ -539,6 +792,11 @@ def run_footprint_matching(
     qc_processing_run_id: int | None = None,
     footprint_provider: FootprintProvider | None = None,
     method_version: str = METHOD_VERSION,
+    platforms: Sequence[str] | None = None,
+    data_source_mode: str = "BOTH",
+    window_preset: int | str | None = None,
+    temporal_window_minutes: float | None = None,
+    grid_resolution_km: float | None = None,
 ) -> dict[str, Any]:
     """Run footprint-aware association in local LAEA using an injected provider.
 
@@ -546,8 +804,16 @@ def run_footprint_matching(
     unusable geometry may use a separately labelled centroid fallback, never
     presented as a true pixel-corner footprint.
     """
-    if max_time_difference_minutes < 0 or max_boundary_distance_km < 0 or fallback_centroid_distance_km <= 0:
-        raise ValueError("time/boundary limits must be >= 0 and centroid fallback must be > 0")
+    max_time_difference_minutes, temporal_source, temporal_preset = resolve_temporal_window(
+        window_preset=window_preset, temporal_window_minutes=temporal_window_minutes,
+        legacy_default=max_time_difference_minutes,
+    )
+    if max_boundary_distance_km < 0 or fallback_centroid_distance_km <= 0:
+        raise ValueError("boundary limit must be >= 0 and centroid fallback must be > 0")
+    if grid_resolution_km is not None and grid_resolution_km not in {1.0, 2.0, 5.0}:
+        raise ValueError("grid_resolution_km must be 1.0, 2.0, 5.0, or None")
+    selected_platforms = sorted(_normalise_platforms(platforms) or [])
+    data_source_mode = data_source_mode.upper()
     box_value = BoundingBox.parse(bbox)
     if (start_date is None) != (end_date is None):
         raise ValueError("start_date and end_date must be supplied together")
@@ -557,11 +823,14 @@ def run_footprint_matching(
         start_at = end_at = start_day = end_day = None
     rows = _filter_observations(
         repository, start_at=start_at, end_at=end_at, bbox=box_value,
-        qc_processing_run_id=qc_processing_run_id,
+        qc_processing_run_id=qc_processing_run_id, platforms=platforms,
+        data_source_mode=data_source_mode, time_padding_minutes=max_time_difference_minutes,
     )
+    query_rows = [row for row in rows if _within_window(row["acquired_at"], start_at, end_at)]
     modis_rows, viirs_rows = _partition_by_sensor(rows)
     context = build_equal_area_context(box_value)
-    provider_impl = footprint_provider or FIRMSScanTrackFootprintProvider()
+    provider_impl = footprint_provider or CompositeFootprintProvider()
+    diagnostics = _platform_diagnostics(platforms, start_at, end_at)
     config, config_json = _matching_run_config(
         method="FOOTPRINT_AWARE", method_version=method_version, bbox=box_value,
         max_time_difference_minutes=max_time_difference_minutes,
@@ -570,6 +839,14 @@ def run_footprint_matching(
         qc_processing_run_id=qc_processing_run_id,
         start_date=start_day.isoformat() if start_day else None,
         end_date=end_day.isoformat() if end_day else None,
+        selected_platforms=selected_platforms or ["ALL"], data_source_mode=data_source_mode,
+        grid_resolution_km=grid_resolution_km,
+        temporal_window_source=temporal_source, temporal_window_preset=temporal_preset,
+        query_start_utc=start_at.isoformat() if start_at else None,
+        query_end_utc=end_at.isoformat() if end_at else None,
+        padded_fetch_start_utc=(start_at - timedelta(minutes=max_time_difference_minutes)).isoformat() if start_at else None,
+        padded_fetch_end_utc=(end_at + timedelta(minutes=max_time_difference_minutes)).isoformat() if end_at else None,
+        platform_diagnostics=diagnostics,
         geometry_source=provider_impl.geometry_source,
         projection=context.crs.to_wkt(),
         geometry_note=(
@@ -580,7 +857,9 @@ def run_footprint_matching(
             "its source geolocation and geometry-construction method."
         ),
     )
-    run_id = repository.create_processing_run("MATCHING", method_version, config_json)
+    config["run_cache_key"] = _run_cache_key(config)
+    config_json = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    run_id = repository.create_processing_run("MATCHING", method_version, config_json, run_cache_key=config["run_cache_key"])
     try:
         modis_geoms: dict[int, Polygon] = {}
         viirs_geoms: dict[int, Polygon] = {}
@@ -616,6 +895,8 @@ def run_footprint_matching(
                 if pair in seen_pairs:
                     continue
                 seen_pairs.add(pair)
+                if not _pair_touches_query_window(modis, viirs, start_at, end_at):
+                    continue
                 v_poly = viirs_geoms[v_id]
                 time_diff = _pair_time_difference_minutes(modis, viirs)
                 centroid_distance = m_poly.centroid.distance(v_poly.centroid) / 1000.0
@@ -691,6 +972,8 @@ def run_footprint_matching(
                         "config_json": config_json,
                     }
                     seen_pairs.add((m_id, v_id))
+                    if not _pair_touches_query_window(modis, viirs, start_at, end_at):
+                        continue
                     if time_diff <= max_time_difference_minutes:
                         edges.append(fallback_record)
                     else:
@@ -735,6 +1018,8 @@ def run_footprint_matching(
                             "config_json": config_json,
                         }
                         seen_pairs.add((m_id, v_id))
+                        if not _pair_touches_query_window(modis, viirs, start_at, end_at):
+                            continue
                         if time_diff <= max_time_difference_minutes:
                             edges.append(fallback_record)
                         else:
@@ -746,9 +1031,23 @@ def run_footprint_matching(
             matched_nodes.add(("MODIS", int(edge["modis_observation_id"])))
             matched_nodes.add(("VIIRS", int(edge["viirs_observation_id"])))
         records = edges + rejected + _unmatched_records(
-            rows, matched_nodes, processing_run_id=run_id,
+            query_rows, matched_nodes, processing_run_id=run_id,
             matching_method="FOOTPRINT_AWARE", config_json=config_json,
         )
+        _attach_candidate_explanations(
+            records, all_rows=rows, query_rows=query_rows,
+            max_time_difference_minutes=max_time_difference_minutes,
+        )
+        # Geometry provenance is pair-specific because one side can be a true
+        # Level-2 corner polygon while the other uses a FIRMS approximation.
+        source_by_id = {int(row["observation_id"]): provider_impl.source_for(row) for row in rows} if isinstance(provider_impl, CompositeFootprintProvider) else {}
+        for record in records:
+            m_id, v_id = record.get("modis_observation_id"), record.get("viirs_observation_id")
+            sources = [source_by_id.get(int(value)) for value in (m_id, v_id) if value is not None and int(value) in source_by_id]
+            if len(sources) == 2 and sources[0] == sources[1]:
+                record["geometry_source"] = sources[0]
+            elif sources and LEVEL2_GEOMETRY_SOURCE in sources:
+                record["geometry_source"] = "MIXED_LEVEL2_AND_FIRMS_GEOMETRY" if len(set(sources)) > 1 else LEVEL2_GEOMETRY_SOURCE
         inserted = repository.insert_candidate_associations(records)
         repository.finish_processing_run(
             run_id, status="COMPLETED", input_count=len(rows), output_count=inserted
@@ -768,12 +1067,22 @@ def run_footprint_matching(
         "output_records": inserted, "relationship_status_counts": dict(status_counts),
         "geometry_source": provider_impl.geometry_source,
         "fallback_geometry_source": POINT_FALLBACK_GEOMETRY_SOURCE,
-        "projection": context.crs.to_string(), "status": "COMPLETED",
+        "projection": context.crs.to_string(), "temporal_window_source": temporal_source,
+        "temporal_window_preset": temporal_preset,
+        "padded_fetch_observations": len(rows), "requested_window_observations": len(query_rows),
+        "cross_midnight_candidate_count": sum(1 for item in records if item.get("is_cross_midnight")),
+        "warnings": ([{"code": "DIURNAL_DRIFT_WARNING", "message": "Temporal window >60 minutes may span material fire-intensity change"}] if max_time_difference_minutes > 60 else []) + diagnostics,
+        "run_cache_key": config["run_cache_key"], "status": "COMPLETED",
     }
 
 
 class FRPObservationOperator(Protocol):
-    """Hook for a future validated fmidev/FRP_OOp implementation."""
+    """Hook for a validated FRP_OOp implementation.
+
+    Implementations may expose ``adjust_with_context(observation, inputs)`` to
+    receive pixel area, day/night, background temperatures and beta_ret. The
+    legacy ``adjust(observation, pixel_area_km2)`` hook remains supported.
+    """
 
     name: str
     version: str
@@ -827,6 +1136,26 @@ def estimate_frp_detection_limit_mw(
     return base_mw * (pixel_area_km2 / reference_area)
 
 
+def _observation_pixel_area_km2(row: Mapping[str, Any]) -> float | None:
+    if row.get("footprint_wkt"):
+        try:
+            geometry = load_wkt(str(row["footprint_wkt"]))
+            context = build_equal_area_context(BoundingBox.parse((
+                max(-179.9, float(row["longitude"]) - 0.05),
+                max(-89.9, float(row["latitude"]) - 0.05),
+                min(179.9, float(row["longitude"]) + 0.05),
+                min(89.9, float(row["latitude"]) + 0.05),
+            )))
+            projected = transform_geometry(context.forward.transform, geometry)
+            area = projected.area / 1_000_000.0
+            if math.isfinite(area) and area > 0:
+                return area
+        except Exception:
+            pass
+    dimensions = _positive_scan_track(row)
+    return dimensions[0] * dimensions[1] if dimensions else None
+
+
 def analyze_frp_measurements(
     repository: DatabaseRepository,
     *,
@@ -872,9 +1201,32 @@ def analyze_frp_measurements(
     try:
         payload: list[dict[str, Any]] = []
         for row in rows:
-            dimensions = _positive_scan_track(row)
-            pixel_area = dimensions[0] * dimensions[1] if dimensions else None
+            pixel_area = _observation_pixel_area_km2(row)
             detection_limit = estimate_frp_detection_limit_mw(row, pixel_area)
+            try:
+                native_attributes = json.loads(str(row.get("native_attributes_json") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                native_attributes = {}
+            try:
+                solar_zenith = float(native_attributes["FP_SolZenAng"]) if native_attributes.get("FP_SolZenAng") is not None else None
+                if solar_zenith is not None and not math.isfinite(solar_zenith):
+                    solar_zenith = None
+            except (TypeError, ValueError):
+                solar_zenith = None
+            operator_inputs = {
+                "pixel_area_km2": pixel_area,
+                "daynight": row.get("daynight"),
+                "solar_flag": row.get("daynight"),
+                "solar_zenith_degrees": solar_zenith,
+                "mean_t4_k": row.get("mean_t4_k"),
+                "mean_t5_k": row.get("mean_t5_k"),
+                # beta_ret is deliberately null until a Level-2 opportunity
+                # result for the same spatial unit and interval is joined. A
+                # bbox-wide fraction must not be reused as a grid-cell value.
+                "beta_ret": row.get("beta_ret"),
+                "beta_ret_status": "UNAVAILABLE_NO_SPATIOTEMPORAL_OPPORTUNITY_JOIN" if row.get("beta_ret") is None else "PROVIDED",
+                "data_source": "LAADS_LEVEL2" if row.get("raw_asset_id") is not None else "FIRMS_CSV",
+            }
             adjusted = None
             adjustment_method = None
             # A model/operator adjustment must not use an observation that
@@ -885,7 +1237,10 @@ def analyze_frp_measurements(
                 and bool(row.get("suitability_for_frp"))
                 and row.get("frp_mw") is not None
             ):
-                adjusted = operator.adjust(row, pixel_area)
+                if hasattr(operator, "adjust_with_context"):
+                    adjusted = operator.adjust_with_context(row, operator_inputs)
+                else:
+                    adjusted = operator.adjust(row, pixel_area)
                 if adjusted is not None:
                     adjusted = float(adjusted)
                     if not math.isfinite(adjusted) or adjusted < 0:
@@ -902,6 +1257,10 @@ def analyze_frp_measurements(
                 "method_version": method_version,
                 "detection_limit_mw": detection_limit,
                 "pixel_area_km2": pixel_area,
+                "operator_inputs_json": json.dumps(operator_inputs, sort_keys=True, separators=(",", ":")),
+                "diagnostic_json": json.dumps({"source_frp_preserved": raw_frp if (raw_frp := (float(row["frp_mw"]) if row.get("frp_mw") is not None else None)) is not None else None,
+                                               "operator_applied": adjusted is not None,
+                                               "geometry_source": row.get("footprint_source")}, sort_keys=True),
                 "evidence_category": "MODEL_ADJUSTED" if adjusted is not None else "DIRECT_SOURCE_OBSERVATION",
             })
         inserted = repository.insert_measurement_results(payload)
@@ -972,6 +1331,8 @@ def build_common_grid_summary(
     qc_processing_run_id: int | None = None,
     footprint_provider: FootprintProvider | None = None,
     method_version: str = METHOD_VERSION,
+    platforms: Sequence[str] | None = None,
+    data_source_mode: str = "BOTH",
 ) -> dict[str, Any]:
     """Build a sparse, equal-area, footprint-weighted activity grid.
 
@@ -994,7 +1355,25 @@ def build_common_grid_summary(
     box_value = BoundingBox.parse(bbox)
     start_at, end_at, start_day, end_day = _date_bounds(start_date, end_date)
     context = build_equal_area_context(box_value)
-    provider_impl = footprint_provider or FIRMSScanTrackFootprintProvider()
+    provider_impl = footprint_provider or CompositeFootprintProvider()
+    selected_platforms = sorted(_normalise_platforms(platforms) or [])
+    data_source_mode = data_source_mode.upper()
+    if data_source_mode not in {"FIRMS", "LAADS_LEVEL2", "BOTH"}:
+        raise ValueError("data_source_mode must be FIRMS, LAADS_LEVEL2, or BOTH")
+    matching_run = None
+    matching_config: dict[str, Any] = {}
+    if matching_run_id is not None:
+        matching_run = repository.get_processing_run(matching_run_id)
+        if matching_run:
+            try:
+                matching_config = json.loads(matching_run.get("configuration_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                matching_config = {}
+        if not selected_platforms:
+            inherited = matching_config.get("selected_platforms") or []
+            selected_platforms = sorted(_normalise_platforms(inherited) or []) if inherited != ["ALL"] else []
+        if data_source_mode == "BOTH" and matching_config.get("data_source_mode"):
+            data_source_mode = str(matching_config["data_source_mode"]).upper()
 
     config = {
         "module": "SANYAM_COMMON_GRID_ACTIVITY",
@@ -1011,13 +1390,24 @@ def build_common_grid_summary(
         "opportunity_evidence": "FIRMS_DETECTION_ONLY",
         "matching_run_id": matching_run_id,
         "qc_processing_run_id": qc_processing_run_id,
-        "no_detection_policy": "UNKNOWN; FIRMS point-only records cannot establish valid non-detection",
+        "selected_platforms": selected_platforms or ["ALL"],
+        "data_source_mode": data_source_mode,
+        "temporal_window_minutes": matching_config.get("max_time_difference_minutes"),
+        "spatial_method": matching_config.get("method", "GRID_ONLY"),
+        "no_detection_policy": "UNKNOWN unless geolocated Level-2 swath mask evidence is provided; FIRMS point-only records cannot establish valid non-detection",
         "storage_strategy": "SPARSE_DETECTED_CELL_PERIODS; omitted cells are implicitly UNKNOWN",
         "uncertainty_sources": [
             "approximate FIRMS scan/track footprint" if provider_impl.geometry_source == FIRMS_GEOMETRY_SOURCE else "provider footprint/geolocation",
             "grid resolution", "FIRMS-only opportunity", "spatial allocation",
         ],
     }
+    config["run_cache_key"] = _run_cache_key({
+        "selected_platforms": selected_platforms or ["ALL"],
+        "max_time_difference_minutes": matching_config.get("max_time_difference_minutes"),
+        "method": matching_config.get("method", "GRID_ONLY"),
+        "grid_resolution_km": grid_resolution_km,
+        "data_source_mode": data_source_mode,
+    })
     config_json = json.dumps(config, sort_keys=True, separators=(",", ":"))
     if matching_run_id is not None:
         matching_run = repository.get_processing_run(matching_run_id)
@@ -1034,7 +1424,7 @@ def build_common_grid_summary(
                 f"(status={matching_run.get('status')!r})"
             )
 
-    run_id = repository.create_processing_run("AGGREGATION", method_version, config_json)
+    run_id = repository.create_processing_run("AGGREGATION", method_version, config_json, run_cache_key=config["run_cache_key"])
 
     try:
         # The query pad allows a footprint whose centre lies just outside the
@@ -1049,7 +1439,11 @@ def build_common_grid_summary(
             west=query_west, east=query_east, south=query_south, north=query_north,
             qc_processing_run_id=qc_processing_run_id,
             require_matching_suitability=True,
+            data_source_mode=data_source_mode,
         )
+        if selected_platforms:
+            allowed_platforms = set(selected_platforms)
+            observations = [row for row in observations if _row_platform(row) in allowed_platforms]
 
         size_m = grid_resolution_km * 1000.0
         minx, miny, maxx, maxy = context.study_polygon.bounds
@@ -1094,7 +1488,8 @@ def build_common_grid_summary(
                     "modis_count": 0.0, "viirs_count": 0.0,
                     "modis_frp_sum_mw": 0.0, "viirs_frp_sum_mw": 0.0,
                     "has_modis_frp": False, "has_viirs_frp": False,
-                    "group_ids": set(), "centroid_fallback_count": 0,
+                    "group_ids": set(), "cross_midnight_group_ids": set(),
+                    "primary_calendar_days": set(), "centroid_fallback_count": 0,
                 }
             return accumulators[key]
 
@@ -1109,10 +1504,23 @@ def build_common_grid_summary(
             return range(r0, r1 + 1), range(c0, c1 + 1)
 
         component_map: dict[tuple[str, int], str] = {}
+        component_calendar: dict[str, dict[str, Any]] = {}
         if matching_run_id is not None:
-            component_map = _components_for_associations(
-                repository.fetch_candidate_associations(matching_run_id)
-            )
+            association_rows = repository.fetch_candidate_associations(matching_run_id)
+            component_map = _components_for_associations(association_rows)
+            for association in association_rows:
+                component_id = association.get("component_id")
+                if not component_id:
+                    continue
+                meta = component_calendar.setdefault(str(component_id), {
+                    "primary_calendar_day": association.get("primary_calendar_day"),
+                    "is_cross_midnight": False,
+                })
+                if association.get("is_cross_midnight"):
+                    meta["is_cross_midnight"] = True
+                primary_day = association.get("primary_calendar_day")
+                if primary_day and (not meta.get("primary_calendar_day") or primary_day < meta["primary_calendar_day"]):
+                    meta["primary_calendar_day"] = primary_day
 
         for observation in observations:
             acquired = _utc(observation["acquired_at"])
@@ -1146,7 +1554,18 @@ def build_common_grid_summary(
                             acc[frp_key] += float(observation["frp_mw"]) * weight
                             acc[has_key] = True
                         if component_id:
-                            acc["group_ids"].add(component_id)
+                            meta = component_calendar.get(component_id, {})
+                            primary_day = meta.get("primary_calendar_day") or acquired.date().isoformat()
+                            primary_in_period = (
+                                periods[period_index][0]
+                                <= datetime.combine(date.fromisoformat(primary_day), time.min, tzinfo=timezone.utc)
+                                < periods[period_index][1]
+                            )
+                            if primary_in_period:
+                                acc["group_ids"].add(component_id)
+                                acc["primary_calendar_days"].add(primary_day)
+                                if meta.get("is_cross_midnight"):
+                                    acc["cross_midnight_group_ids"].add(component_id)
                 continue
 
             # Explicit point-centroid fallback when scan/track footprint
@@ -1172,7 +1591,18 @@ def build_common_grid_summary(
                 acc[frp_key] += float(observation["frp_mw"])
                 acc[has_key] = True
             if component_id:
-                acc["group_ids"].add(component_id)
+                meta = component_calendar.get(component_id, {})
+                primary_day = meta.get("primary_calendar_day") or acquired.date().isoformat()
+                primary_in_period = (
+                    periods[period_index][0]
+                    <= datetime.combine(date.fromisoformat(primary_day), time.min, tzinfo=timezone.utc)
+                    < periods[period_index][1]
+                )
+                if primary_in_period:
+                    acc["group_ids"].add(component_id)
+                    acc["primary_calendar_days"].add(primary_day)
+                    if meta.get("is_cross_midnight"):
+                        acc["cross_midnight_group_ids"].add(component_id)
 
         # Persist only detected cell-period combinations. All omitted cells are
         # implicitly UNKNOWN because FIRMS has no full swath/cloud mask.
@@ -1214,6 +1644,19 @@ def build_common_grid_summary(
                 "valid_area_fraction": None,
                 "opportunity_summary": json.dumps(opportunity_summary, sort_keys=True, separators=(",", ":")),
                 "activity_status": "DETECTED_ACTIVITY",
+                "primary_calendar_day": min(acc["primary_calendar_days"]) if acc["primary_calendar_days"] else periods[period_index][0].date().isoformat(),
+                "is_cross_midnight": bool(acc["cross_midnight_group_ids"]),
+                "explanation_json": json.dumps({
+                    "plain_language": (
+                        f"{len(acc['cross_midnight_group_ids'])} cross-midnight candidate group(s) assigned once to "
+                        f"{min(acc['primary_calendar_days'])}." if acc["cross_midnight_group_ids"] else
+                        "Detection observations are allocated to this UTC calendar period; matched-group counts are assigned only to each component's primary UTC day."
+                    ),
+                    "assigned_candidate_group_ids": sorted(acc["group_ids"]),
+                    "cross_midnight_candidate_group_ids": sorted(acc["cross_midnight_group_ids"]),
+                    "primary_calendar_day": min(acc["primary_calendar_days"]) if acc["primary_calendar_days"] else periods[period_index][0].date().isoformat(),
+                    "evidence_source": data_source_mode,
+                }, sort_keys=True, separators=(",", ":")),
             })
 
         inserted = repository.insert_aggregation_results(payload)
@@ -1238,6 +1681,9 @@ def build_common_grid_summary(
         "storage_strategy": "SPARSE_DETECTED_CELL_PERIODS",
         "omitted_cell_period_status": "UNKNOWN",
         "valid_area_fraction": None,
+        "run_cache_key": config["run_cache_key"],
+        "selected_platforms": selected_platforms or ["ALL"],
+        "data_source_mode": data_source_mode,
         "status": "COMPLETED",
     }
 
@@ -1267,7 +1713,11 @@ def _observation_geojson_geometry(
     polygon = provider_impl.build_polygon(observation, context)
     if polygon is None:
         return Point(float(observation["longitude"]), float(observation["latitude"])), POINT_FALLBACK_GEOMETRY_SOURCE
-    return transform_geometry(context.inverse.transform, polygon), provider_impl.geometry_source
+    if isinstance(provider_impl, CompositeFootprintProvider):
+        source = provider_impl.source_for(observation)
+    else:
+        source = provider_impl.geometry_source
+    return transform_geometry(context.inverse.transform, polygon), source
 
 
 def export_validation_geojson(
@@ -1300,7 +1750,7 @@ def export_validation_geojson(
     association_run_id = processing_run_id
     if run["module_name"] == "AGGREGATION" and config.get("matching_run_id") is not None:
         association_run_id = int(config["matching_run_id"])
-    provider_impl = footprint_provider or FIRMSScanTrackFootprintProvider()
+    provider_impl = footprint_provider or CompositeFootprintProvider()
     expected_geometry_source = config.get("geometry_source")
     if expected_geometry_source and str(expected_geometry_source) != provider_impl.geometry_source:
         raise ValueError(
@@ -1411,6 +1861,9 @@ def export_validation_geojson(
             "opportunity_summary": opportunity_summary_value,
             "activity_status": row.get("activity_status"),
             "valid_area_fraction": row.get("valid_area_fraction"),
+            "primary_calendar_day": row.get("primary_calendar_day"),
+            "is_cross_midnight": row.get("is_cross_midnight"),
+            "explanation": json.loads(row.get("explanation_json") or "{}"),
         }))
 
     out = Path(output_dir)
@@ -1445,17 +1898,27 @@ def _build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--end-date", required=True)
     baseline.add_argument("--bbox", default=None, help="west,south,east,north")
     baseline.add_argument("--max-distance-km", type=float, default=DEFAULT_BASELINE_DISTANCE_KM)
-    baseline.add_argument("--max-time-minutes", type=float, default=DEFAULT_TIME_DIFFERENCE_MINUTES)
+    baseline.add_argument("--max-time-minutes", type=float, default=DEFAULT_TIME_DIFFERENCE_MINUTES, help="legacy/custom temporal threshold")
+    baseline.add_argument("--window-preset", type=int, choices=TEMPORAL_WINDOW_PRESETS, default=None)
+    baseline.add_argument("--custom-window-minutes", type=float, default=None, help="custom temporal threshold 1..360")
+    baseline.add_argument("--platforms", default=None, help="comma-separated Terra,Aqua,Suomi-NPP,NOAA-20,NOAA-21")
+    baseline.add_argument("--data-source-mode", choices=("FIRMS", "LAADS_LEVEL2", "BOTH"), default="BOTH")
     baseline.add_argument("--qc-processing-run-id", type=int, default=None)
+    baseline.add_argument("--grid-resolution-km", type=float, choices=(1.0, 2.0, 5.0), default=None)
 
     footprint = sub.add_parser("footprint", help="Approximate footprint-aware matching")
     footprint.add_argument("--bbox", required=True)
     footprint.add_argument("--start-date", required=True)
     footprint.add_argument("--end-date", required=True)
-    footprint.add_argument("--max-time-minutes", type=float, default=DEFAULT_TIME_DIFFERENCE_MINUTES)
+    footprint.add_argument("--max-time-minutes", type=float, default=DEFAULT_TIME_DIFFERENCE_MINUTES, help="legacy/custom temporal threshold")
+    footprint.add_argument("--window-preset", type=int, choices=TEMPORAL_WINDOW_PRESETS, default=None)
+    footprint.add_argument("--custom-window-minutes", type=float, default=None, help="custom temporal threshold 1..360")
+    footprint.add_argument("--platforms", default=None, help="comma-separated platforms")
+    footprint.add_argument("--data-source-mode", choices=("FIRMS", "LAADS_LEVEL2", "BOTH"), default="BOTH")
     footprint.add_argument("--max-boundary-km", type=float, default=DEFAULT_BOUNDARY_DISTANCE_KM)
     footprint.add_argument("--fallback-centroid-km", type=float, default=DEFAULT_FALLBACK_CENTROID_DISTANCE_KM)
     footprint.add_argument("--qc-processing-run-id", type=int, default=None)
+    footprint.add_argument("--grid-resolution-km", type=float, choices=(1.0, 2.0, 5.0), default=None)
 
     frp = sub.add_parser("frp", help="Preserve raw FRP and calculate detection-limit diagnostics")
     frp.add_argument("--start-date", default=None)
@@ -1471,6 +1934,8 @@ def _build_parser() -> argparse.ArgumentParser:
     grid.add_argument("--period-days", type=int, default=1)
     grid.add_argument("--matching-run-id", type=int, default=None)
     grid.add_argument("--qc-processing-run-id", type=int, default=None)
+    grid.add_argument("--platforms", default=None, help="comma-separated Terra,Aqua,Suomi-NPP,NOAA-20,NOAA-21")
+    grid.add_argument("--data-source-mode", choices=("FIRMS", "LAADS_LEVEL2", "BOTH"), default="BOTH")
 
     export = sub.add_parser("export", help="Export three GeoJSON layers for a processing run")
     export.add_argument("--processing-run-id", type=int, required=True)
@@ -1494,6 +1959,11 @@ def main(argv: list[str] | None = None) -> int:
                 max_distance_km=args.max_distance_km,
                 max_time_difference_minutes=args.max_time_minutes,
                 qc_processing_run_id=args.qc_processing_run_id,
+                platforms=[part.strip() for part in args.platforms.split(",") if part.strip()] if args.platforms else None,
+                data_source_mode=args.data_source_mode,
+                window_preset=args.window_preset,
+                temporal_window_minutes=args.custom_window_minutes,
+                grid_resolution_km=args.grid_resolution_km,
             )
         elif args.command == "footprint":
             result = run_footprint_matching(
@@ -1502,6 +1972,11 @@ def main(argv: list[str] | None = None) -> int:
                 max_boundary_distance_km=args.max_boundary_km,
                 fallback_centroid_distance_km=args.fallback_centroid_km,
                 qc_processing_run_id=args.qc_processing_run_id,
+                platforms=[part.strip() for part in args.platforms.split(",") if part.strip()] if args.platforms else None,
+                data_source_mode=args.data_source_mode,
+                window_preset=args.window_preset,
+                temporal_window_minutes=args.custom_window_minutes,
+                grid_resolution_km=args.grid_resolution_km,
             )
         elif args.command == "frp":
             result = analyze_frp_measurements(
@@ -1513,6 +1988,8 @@ def main(argv: list[str] | None = None) -> int:
                 repository, bbox=args.bbox, start_date=args.start_date, end_date=args.end_date,
                 grid_resolution_km=args.resolution_km, period_days=args.period_days,
                 matching_run_id=args.matching_run_id, qc_processing_run_id=args.qc_processing_run_id,
+                platforms=[part.strip() for part in args.platforms.split(",") if part.strip()] if args.platforms else None,
+                data_source_mode=args.data_source_mode,
             )
         elif args.command == "export":
             result = export_validation_geojson(

@@ -22,6 +22,7 @@ from sqlalchemy import (
     ForeignKey,
     Identity,
     and_,
+    or_,
     exists,
     func,
     Index,
@@ -110,6 +111,13 @@ raw_assets = Table(
     Column("sha256", String(64), nullable=False),
     Column("media_type", String(96), nullable=False, server_default=text("'text/csv'")),
     Column("byte_size", BigInteger, nullable=True),
+    Column("granule_id", String(160), nullable=True),
+    Column("product_id", String(32), nullable=True),
+    Column("collection_id", String(16), nullable=True),
+    Column("platform", String(32), nullable=True),
+    Column("acquisition_start", UTCDateTime(), nullable=True),
+    Column("acquisition_end", UTCDateTime(), nullable=True),
+    Column("file_size", BigInteger, nullable=True),
     Column("created_at", UTCDateTime(), nullable=False),
     UniqueConstraint("ingestion_run_id", "sha256", name="uq_raw_assets_run_sha256"),
 )
@@ -120,6 +128,22 @@ observations = Table(
     metadata,
     Column("observation_id", Integer, Identity(), primary_key=True),
     Column("source_row_hash", String(64), nullable=False, unique=True),
+    Column("raw_asset_id", Integer, ForeignKey("raw_assets.raw_asset_id", ondelete="RESTRICT"), nullable=True),
+    Column("raw_asset_sha256", String(64), nullable=True),
+    Column("native_attributes_json", Text, nullable=True),
+    Column("granule_id", String(160), nullable=True),
+    Column("product_id", String(32), nullable=True),
+    Column("pixel_line", Integer, nullable=True),
+    Column("pixel_sample", Integer, nullable=True),
+    Column("fire_mask_class", Integer, nullable=True),
+    Column("algorithm_qa", BigInteger, nullable=True),
+    Column("adjacent_cloud_count", Integer, nullable=True),
+    Column("native_t21_k", Float, nullable=True),
+    Column("native_t31_k", Float, nullable=True),
+    Column("mean_t4_k", Float, nullable=True),
+    Column("mean_t5_k", Float, nullable=True),
+    Column("acquisition_time_precision", String(48), nullable=True),
+    Column("footprint_wkt", Text, nullable=True),
     Column("dataset_id", String(64), nullable=False),
     Column("processing_type", String(8), nullable=False),
     Column("sensor", String(16), nullable=False),
@@ -162,6 +186,7 @@ processing_runs = Table(
     Column("module_name", String(24), nullable=False),
     Column("method_version", String(64), nullable=False),
     Column("configuration_json", Text, nullable=False),
+    Column("run_cache_key", String(64), nullable=True),
     Column("started_at", UTCDateTime(), nullable=False),
     Column("completed_at", UTCDateTime(), nullable=True),
     Column("input_count", Integer, nullable=False, server_default=text("0")),
@@ -178,6 +203,9 @@ idx_processing_runs_module_method = Index(
     processing_runs.c.module_name,
     processing_runs.c.method_version,
     processing_runs.c.status,
+)
+idx_processing_runs_cache_key = Index(
+    "idx_processing_runs_cache_key", processing_runs.c.run_cache_key
 )
 
 qc_results = Table(
@@ -220,6 +248,13 @@ observation_opportunities = Table(
     Column("opportunity_state", String(32), nullable=False),
     Column("evidence_source", String(48), nullable=False),
     Column("notes", Text, nullable=True),
+    Column("beta_ret", Float, nullable=True),
+    Column("valid_observed_area_km2", Float, nullable=True),
+    Column("covered_area_km2", Float, nullable=True),
+    Column("cloud_area_fraction", Float, nullable=True),
+    Column("invalid_quality_fraction", Float, nullable=True),
+    Column("granule_ids_json", Text, nullable=True),
+    Column("explanation_json", Text, nullable=True),
     Column("created_at", UTCDateTime(), nullable=False),
     CheckConstraint("sensor IN ('MODIS', 'VIIRS')", name="ck_opportunity_sensor"),
     CheckConstraint(
@@ -262,6 +297,9 @@ candidate_associations = Table(
     Column("modis_degree", Integer, nullable=True),
     Column("viirs_degree", Integer, nullable=True),
     Column("component_id", String(64), nullable=True),
+    Column("is_cross_midnight", Boolean, nullable=False, server_default=text("FALSE")),
+    Column("primary_calendar_day", String(10), nullable=True),
+    Column("explanation_json", Text, nullable=False, server_default=text("'{}'")),
     Column("config_json", Text, nullable=False),
     UniqueConstraint(
         "processing_run_id", "matching_method", "modis_observation_id", "viirs_observation_id",
@@ -296,6 +334,8 @@ measurement_results = Table(
     Column("method_version", String(64), nullable=False),
     Column("detection_limit_mw", Float, nullable=True),
     Column("pixel_area_km2", Float, nullable=True),
+    Column("operator_inputs_json", Text, nullable=True),
+    Column("diagnostic_json", Text, nullable=True),
     Column("evidence_category", String(40), nullable=False),
     Column("created_at", UTCDateTime(), nullable=False),
     UniqueConstraint("processing_run_id", "observation_id", name="uq_measurement_run_observation"),
@@ -327,6 +367,9 @@ aggregation_results = Table(
     Column("valid_area_fraction", Float, nullable=True),
     Column("opportunity_summary", Text, nullable=False),
     Column("activity_status", String(32), nullable=False),
+    Column("primary_calendar_day", String(10), nullable=True),
+    Column("is_cross_midnight", Boolean, nullable=False, server_default=text("FALSE")),
+    Column("explanation_json", Text, nullable=False, server_default=text("'{}'")),
     Column("created_at", UTCDateTime(), nullable=False),
     UniqueConstraint("processing_run_id", "grid_cell_id", "period_start", "period_end", name="uq_aggregation_run_cell_period"),
     CheckConstraint("grid_resolution_km > 0", name="ck_aggregation_grid_resolution"),
@@ -505,6 +548,63 @@ def _backfill_raw_assets(engine: Engine) -> None:
             })
         if payload:
             connection.execute(raw_assets.insert(), payload)
+
+
+def _migrate_level2_additive_columns(engine: Engine) -> None:
+    """Add LAADS Level-2 provenance, diagnostics and calendar columns in place.
+
+    SQLite and PostgreSQL both support these nullable/defaulted ADD COLUMN
+    operations. Existing FIRMS rows retain their original values.
+    """
+    additions: dict[str, dict[str, str]] = {
+        "processing_runs": {"run_cache_key": "VARCHAR(64)"},
+        "raw_assets": {
+            "granule_id": "VARCHAR(160)", "product_id": "VARCHAR(32)",
+            "collection_id": "VARCHAR(16)", "platform": "VARCHAR(32)",
+            "acquisition_start": "TIMESTAMP WITH TIME ZONE",
+            "acquisition_end": "TIMESTAMP WITH TIME ZONE", "file_size": "BIGINT",
+        },
+        "observations": {
+            "raw_asset_id": "INTEGER", "raw_asset_sha256": "VARCHAR(64)",
+            "native_attributes_json": "TEXT", "granule_id": "VARCHAR(160)", "product_id": "VARCHAR(32)",
+            "pixel_line": "INTEGER", "pixel_sample": "INTEGER",
+            "fire_mask_class": "INTEGER", "algorithm_qa": "BIGINT",
+            "adjacent_cloud_count": "INTEGER", "native_t21_k": "FLOAT",
+            "native_t31_k": "FLOAT", "mean_t4_k": "FLOAT", "mean_t5_k": "FLOAT",
+            "acquisition_time_precision": "VARCHAR(48)", "footprint_wkt": "TEXT",
+        },
+        "observation_opportunities": {
+            "beta_ret": "FLOAT", "valid_observed_area_km2": "FLOAT",
+            "covered_area_km2": "FLOAT", "cloud_area_fraction": "FLOAT",
+            "invalid_quality_fraction": "FLOAT", "granule_ids_json": "TEXT",
+            "explanation_json": "TEXT",
+        },
+        "candidate_associations": {
+            "is_cross_midnight": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "primary_calendar_day": "VARCHAR(10)",
+            "explanation_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+        "measurement_results": {
+            "operator_inputs_json": "TEXT", "diagnostic_json": "TEXT",
+        },
+        "aggregation_results": {
+            "primary_calendar_day": "VARCHAR(10)",
+            "is_cross_midnight": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "explanation_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    }
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as connection:
+        for table_name, columns in additions.items():
+            if table_name not in existing_tables:
+                continue
+            existing = {col["name"] for col in inspect(engine).get_columns(table_name)}
+            for column_name, sql_type in columns.items():
+                if column_name not in existing:
+                    connection.exec_driver_sql(
+                        f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {sql_type}'
+                    )
 
 
 def _migrate_processing_run_modules(engine: Engine) -> None:
@@ -692,6 +792,38 @@ class DatabaseRepository:
                     index_elements=[raw_assets.c.ingestion_run_id, raw_assets.c.sha256]
                 ))
 
+    def create_raw_asset(self, values: Mapping[str, Any]) -> int:
+        """Persist immutable source-file metadata and return raw_asset_id."""
+        row = dict(values)
+        row.setdefault("created_at", datetime.now(timezone.utc))
+        required = {"ingestion_run_id", "asset_role", "storage_uri", "sha256", "media_type"}
+        missing = required.difference(row)
+        if missing:
+            raise ValueError(f"raw asset is missing required fields: {sorted(missing)}")
+        statement = raw_assets.insert().values(row).returning(raw_assets.c.raw_asset_id)
+        with self.engine.begin() as connection:
+            return int(connection.execute(statement).scalar_one())
+
+    def fetch_raw_assets(
+        self, *, start_at: datetime | None = None, end_at: datetime | None = None,
+        platforms: Iterable[str] | None = None, limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        statement = select(raw_assets).order_by(raw_assets.c.raw_asset_id.desc()).limit(limit)
+        if start_at is not None:
+            statement = statement.where(or_(
+                raw_assets.c.acquisition_end >= start_at,
+                raw_assets.c.acquisition_end.is_(None),
+            ))
+        if end_at is not None:
+            statement = statement.where(or_(
+                raw_assets.c.acquisition_start < end_at,
+                raw_assets.c.acquisition_start.is_(None),
+            ))
+        if platforms:
+            statement = statement.where(raw_assets.c.platform.in_(list(platforms)))
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
     def insert_observations(
         self,
         run_id: int,
@@ -733,6 +865,8 @@ class DatabaseRepository:
         module_name: str,
         method_version: str,
         configuration_json: str,
+        *,
+        run_cache_key: str | None = None,
     ) -> int:
         if module_name not in {"QC", "OPPORTUNITY", "MATCHING", "MEASUREMENT", "AGGREGATION"}:
             raise ValueError("unsupported processing module_name")
@@ -742,6 +876,7 @@ class DatabaseRepository:
                 module_name=module_name,
                 method_version=method_version,
                 configuration_json=configuration_json,
+                run_cache_key=run_cache_key,
                 started_at=datetime.now(timezone.utc),
                 input_count=0,
                 output_count=0,
@@ -838,6 +973,7 @@ class DatabaseRepository:
         start_at: datetime,
         end_at: datetime,
         qc_processing_run_id: int | None = None,
+        platforms: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return observations with their latest completed QC result, if any."""
         if qc_processing_run_id is None:
@@ -885,6 +1021,26 @@ class DatabaseRepository:
                 observations.c.acquired_at < end_at,
             )
             .order_by(observations.c.acquired_at, observations.c.observation_id)
+        )
+        if platforms:
+            statement = statement.where(observations.c.satellite.in_(list(platforms)))
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def fetch_opportunities(self, processing_run_id: int) -> list[dict[str, Any]]:
+        statement = (
+            select(observation_opportunities)
+            .where(observation_opportunities.c.processing_run_id == processing_run_id)
+            .order_by(observation_opportunities.c.opportunity_id)
+        )
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def fetch_qc_results(self, processing_run_id: int) -> list[dict[str, Any]]:
+        statement = (
+            select(qc_results)
+            .where(qc_results.c.processing_run_id == processing_run_id)
+            .order_by(qc_results.c.qc_result_id)
         )
         with self.engine.connect() as connection:
             return [dict(row) for row in connection.execute(statement).mappings().all()]
@@ -954,6 +1110,8 @@ class DatabaseRepository:
         qc_processing_run_id: int | None = None,
         require_matching_suitability: bool = True,
         require_frp_suitability: bool = False,
+        platforms: Iterable[str] | None = None,
+        data_source_mode: str | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch observations with a completed QC result; no source rows are mutated."""
         qc_subquery = (
@@ -1004,6 +1162,16 @@ class DatabaseRepository:
             statement = statement.where(qc_results.c.suitability_for_matching.is_(True))
         if require_frp_suitability:
             statement = statement.where(qc_results.c.suitability_for_frp.is_(True))
+        if platforms:
+            statement = statement.where(observations.c.satellite.in_(list(platforms)))
+        if data_source_mode:
+            mode = data_source_mode.upper()
+            if mode == "FIRMS":
+                statement = statement.where(observations.c.raw_asset_id.is_(None))
+            elif mode in {"LAADS", "LAADS_LEVEL2"}:
+                statement = statement.where(observations.c.raw_asset_id.is_not(None))
+            elif mode != "BOTH":
+                raise ValueError("data_source_mode must be FIRMS, LAADS_LEVEL2, or BOTH")
         statement = statement.order_by(observations.c.acquired_at, observations.c.observation_id)
         with self.engine.connect() as connection:
             return [dict(row) for row in connection.execute(statement).mappings().all()]
@@ -1188,6 +1356,8 @@ def connect_db(database_url: str | Path | None = None) -> DatabaseRepository:
             qc_results, observation_opportunities, candidate_associations,
             measurement_results, aggregation_results,
         ])
+        _migrate_level2_additive_columns(engine)
+        idx_processing_runs_cache_key.create(engine, checkfirst=True)
         for index in (
             idx_observations_acquired_at,
             idx_observations_dataset_time,
@@ -1196,6 +1366,7 @@ def connect_db(database_url: str | Path | None = None) -> DatabaseRepository:
             idx_runs_dataset_status,
             idx_raw_assets_sha256,
             idx_processing_runs_module_method,
+            idx_processing_runs_cache_key,
             idx_qc_results_observation,
             idx_qc_results_run,
             idx_opportunities_lookup,

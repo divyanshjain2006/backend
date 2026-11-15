@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+
+import numpy as np
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +25,8 @@ from qc_and_opportunity import (
     FIRMSDetectionOnlyProvider,
     evaluate_observation_opportunity,
     evaluate_observation_qc,
+    Level2SwathOpportunityProvider,
+    classify_level2_swath_opportunity,
     query_opportunity_summary,
     run_quality_control,
 )
@@ -116,6 +120,21 @@ class TestQualityControl(RepositoryTestCase):
                 "confidence_raw": row["confidence"], "raw_json": "{}",
             })
             self.assertEqual(evaluation["source_confidence_category"], expected)
+
+    def test_viirs_bowtie_and_sun_glint_mask_classes_generate_structured_warnings(self):
+        base = {
+            "observation_id": 17, "sensor": "VIIRS", "dataset_id": "VIIRS_LAADS_VNP14IMG_002",
+            "processing_type": "SP", "latitude": 10, "longitude": 20,
+            "acquired_at": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "first_ingested_at": datetime(2024, 1, 2, tzinfo=timezone.utc),
+            "scan": None, "track": None, "frp_mw": 2, "confidence_raw": "n",
+            "raw_asset_id": 1, "raw_json": json.dumps({"source": "LAADS_LEVEL2"}),
+            "fire_mask_class": 1, "algorithm_qa": 0,
+        }
+        bowtie = evaluate_observation_qc(base)
+        self.assertIn("BOWTIE_EDGE_PIXEL", {item["code"] for item in json.loads(bowtie["warnings_json"])})
+        sun_glint = evaluate_observation_qc(dict(base, fire_mask_class=2))
+        self.assertIn("SUN_GLINT_QA_FLAG", {item["code"] for item in json.loads(sun_glint["warnings_json"])})
 
     def test_low_confidence_viirs_generates_warning(self):
         self.add_observation("VIIRS_NOAA20_SP", dict(VIIRS_ROW, confidence="l"))
@@ -377,3 +396,80 @@ class TestObservationOpportunity(RepositoryTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLevel2SwathOpportunity(RepositoryTestCase):
+    def setUp(self):
+        super().setUp()
+        self.bbox = "-0.25,-0.25,0.25,0.25"
+        self.corner_latitude = np.array([[-0.5, -0.5], [0.5, 0.5]], dtype=float)
+        self.corner_longitude = np.array([[-0.5, 0.5], [-0.5, 0.5]], dtype=float)
+        self.start_at = datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc)
+        self.end_at = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
+
+    def _provider(self, mask):
+        return Level2SwathOpportunityProvider([{
+            "sensor": "MODIS", "platform": "Terra", "granule_id": "MOD14.TEST",
+            "product_id": "MOD14", "collection": "61", "raw_asset_id": 12,
+            "sha256": "a" * 64, "storage_uri": "/raw/MOD14.TEST.hdf",
+            "fire_mask": np.asarray([[mask]], dtype=np.uint8),
+            "corner_latitude": self.corner_latitude,
+            "corner_longitude": self.corner_longitude,
+            "start_at": self.start_at, "end_at": self.end_at,
+            "bbox": self.bbox,
+        }])
+
+    def test_clear_land_is_valid_no_detection_with_beta(self):
+        result = classify_level2_swath_opportunity(
+            sensor="MODIS", fire_mask=[[5]],
+            corner_latitude=self.corner_latitude,
+            corner_longitude=self.corner_longitude, bbox=self.bbox,
+        )
+        self.assertEqual(result["opportunity_state"], "VALID_NO_DETECTION")
+        self.assertAlmostEqual(result["beta_ret"], 1.0, places=5)
+        self.assertEqual(result["geometry_source"], "LEVEL2_PIXEL_CORNERS")
+
+    def test_cloud_pixel_is_cloud_obscured_not_valid_no_detection(self):
+        result = classify_level2_swath_opportunity(
+            sensor="MODIS", fire_mask=[[4]],
+            corner_latitude=self.corner_latitude,
+            corner_longitude=self.corner_longitude, bbox=self.bbox,
+        )
+        self.assertEqual(result["opportunity_state"], "CLOUD_OBSCURED")
+        self.assertGreater(result["cloud_area_fraction"], 0.9)
+        self.assertEqual(result["beta_ret"], 0.0)
+
+    def test_level2_opportunity_provider_persists_granule_scoped_states_and_provenance(self):
+        clear = evaluate_observation_opportunity(
+            self.repository, bbox=self.bbox, start_date="2024-01-02", end_date="2024-01-02",
+            sensor="MODIS", platforms=["Terra"], provider=self._provider(5),
+            data_source_mode="LAADS_LEVEL2",
+        )
+        cloud = evaluate_observation_opportunity(
+            self.repository, bbox=self.bbox, start_date="2024-01-02", end_date="2024-01-02",
+            sensor="MODIS", platforms=["Terra"], provider=self._provider(4),
+            data_source_mode="LAADS_LEVEL2",
+        )
+        clear_rows = self.get_opportunities_for_run(clear["processing_run_id"])
+        cloud_rows = self.get_opportunities_for_run(cloud["processing_run_id"])
+        self.assertEqual(clear_rows[0]["opportunity_state"], "VALID_NO_DETECTION")
+        self.assertEqual(cloud_rows[0]["opportunity_state"], "CLOUD_OBSCURED")
+        self.assertEqual(clear_rows[0]["time_window_start"], self.start_at)
+        explanation = json.loads(clear_rows[0]["explanation_json"])
+        self.assertEqual(explanation["provenance"]["raw_asset_id"], 12)
+        self.assertEqual(explanation["provenance"]["sha256"], "a" * 64)
+
+    def test_missing_corner_geometry_cannot_prove_non_detection(self):
+        provider = Level2SwathOpportunityProvider([{
+            "sensor": "MODIS", "platform": "Terra", "granule_id": "MOD14.NO_CORNERS",
+            "fire_mask": np.asarray([[5]]), "start_at": self.start_at, "end_at": self.end_at,
+            "bbox": self.bbox,
+        }])
+        result = evaluate_observation_opportunity(
+            self.repository, bbox=self.bbox, start_date="2024-01-02", end_date="2024-01-02",
+            sensor="MODIS", platforms=["Terra"], provider=provider, data_source_mode="LAADS_LEVEL2",
+        )
+        rows = self.get_opportunities_for_run(result["processing_run_id"])
+        self.assertEqual(rows[0]["opportunity_state"], "UNKNOWN")
+        self.assertIsNone(rows[0]["beta_ret"])
+

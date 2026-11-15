@@ -2,7 +2,7 @@ import json
 import math
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import create_engine, inspect, select, update
@@ -513,3 +513,115 @@ class MatchingRepositoryTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_midnight_boundary_padding_matches_utc_partner_and_assigns_primary_day(self):
+        modis_id = self.add_observation("MODIS", lon=75.7873, lat=26.9124)
+        viirs_id = self.add_observation("VIIRS", lon=75.7874, lat=26.9124)
+        with self.repository.engine.begin() as connection:
+            connection.execute(update(__import__("db").observations).where(
+                __import__("db").observations.c.observation_id == modis_id
+            ).values(acquired_at=datetime(2026, 11, 12, 23, 55, tzinfo=timezone.utc)))
+            connection.execute(update(__import__("db").observations).where(
+                __import__("db").observations.c.observation_id == viirs_id
+            ).values(acquired_at=datetime(2026, 11, 13, 0, 5, tzinfo=timezone.utc)))
+        self.run_qc()
+        result = run_baseline_matching(
+            self.repository, start_date="2026-11-12", end_date="2026-11-12",
+            bbox="75.7,26.8,75.9,27.0", window_preset=15,
+        )
+        self.assertEqual(result["candidate_edges"], 1)
+        self.assertEqual(result["requested_window_observations"], 1)
+        self.assertEqual(result["padded_fetch_observations"], 2)
+        edge = next(row for row in self.fetch_candidates(result["processing_run_id"])
+                    if row["modis_observation_id"] is not None and row["viirs_observation_id"] is not None)
+        self.assertAlmostEqual(edge["time_difference_minutes"], 10.0)
+        self.assertTrue(edge["is_cross_midnight"])
+        self.assertEqual(edge["primary_calendar_day"], "2026-11-12")
+        explanation = json.loads(edge["explanation_json"])
+        self.assertIn("UTC midnight", explanation["plain_language"])
+
+    def test_cross_midnight_candidate_group_is_counted_only_on_primary_utc_day(self):
+        modis_id = self.add_observation("MODIS", lon=75.7873, lat=26.9124)
+        viirs_id = self.add_observation("VIIRS", lon=75.7874, lat=26.9124)
+        from db import observations
+        with self.repository.engine.begin() as connection:
+            connection.execute(update(observations).where(observations.c.observation_id == modis_id).values(
+                acquired_at=datetime(2026, 11, 12, 23, 55, tzinfo=timezone.utc)))
+            connection.execute(update(observations).where(observations.c.observation_id == viirs_id).values(
+                acquired_at=datetime(2026, 11, 13, 0, 5, tzinfo=timezone.utc)))
+        self.run_qc()
+        matching = run_baseline_matching(
+            self.repository, start_date="2026-11-12", end_date="2026-11-12",
+            bbox="75.7,26.8,75.9,27.0", window_preset=15,
+        )
+        day_one = build_common_grid_summary(
+            self.repository, bbox="75.7,26.8,75.9,27.0", start_date="2026-11-12",
+            end_date="2026-11-12", matching_run_id=matching["processing_run_id"],
+        )
+        day_two = build_common_grid_summary(
+            self.repository, bbox="75.7,26.8,75.9,27.0", start_date="2026-11-13",
+            end_date="2026-11-13", matching_run_id=matching["processing_run_id"],
+        )
+        rows_one = self.repository.fetch_aggregation_results(day_one["processing_run_id"])
+        rows_two = self.repository.fetch_aggregation_results(day_two["processing_run_id"])
+        self.assertTrue(rows_one)
+        self.assertTrue(any(row["is_cross_midnight"] for row in rows_one))
+        self.assertTrue(all(row["primary_calendar_day"] == "2026-11-12" for row in rows_one))
+        group_count_day_one = sum(row["matched_group_count"] or 0 for row in rows_one)
+        group_count_day_two = sum(row["matched_group_count"] or 0 for row in rows_two)
+        self.assertGreaterEqual(group_count_day_one, 1)
+        self.assertEqual(group_count_day_two, 0)
+
+    def test_platform_selection_filters_observations_and_stores_cache_key(self):
+        self.add_observation("MODIS")
+        self.add_observation("VIIRS")
+        self.run_qc()
+        result = run_baseline_matching(
+            self.repository, start_date="2024-01-02", end_date="2024-01-02",
+            bbox="75.7,26.8,75.9,27.0", platforms=["Terra"], window_preset=30,
+            data_source_mode="FIRMS", grid_resolution_km=2.0,
+        )
+        self.assertEqual(result["input_observations"], 1)
+        self.assertEqual(result["candidate_edges"], 0)
+        run = self.repository.get_processing_run(result["processing_run_id"])
+        self.assertEqual(run["run_cache_key"], result["run_cache_key"])
+        config = json.loads(run["configuration_json"])
+        self.assertEqual(config["selected_platforms"], ["Terra"])
+        self.assertEqual(config["grid_resolution_km"], 2.0)
+        self.assertEqual(config["max_time_difference_minutes"], 30.0)
+
+    def test_temporal_preset_custom_and_diurnal_drift_warning(self):
+        modis_id = self.add_observation("MODIS")
+        viirs_id = self.add_observation("VIIRS")
+        from db import observations
+        with self.repository.engine.begin() as connection:
+            connection.execute(update(observations).where(observations.c.observation_id == modis_id).values(
+                acquired_at=datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc)))
+            connection.execute(update(observations).where(observations.c.observation_id == viirs_id).values(
+                acquired_at=datetime(2024, 1, 2, 13, 10, tzinfo=timezone.utc)))
+        self.run_qc()
+        narrow = run_baseline_matching(
+            self.repository, start_date="2024-01-02", end_date="2024-01-02",
+            bbox="75.7,26.8,75.9,27.0", window_preset=60,
+        )
+        self.assertEqual(narrow["candidate_edges"], 0)
+        broad = run_baseline_matching(
+            self.repository, start_date="2024-01-02", end_date="2024-01-02",
+            bbox="75.7,26.8,75.9,27.0", temporal_window_minutes=90,
+        )
+        self.assertEqual(broad["candidate_edges"], 1)
+        self.assertTrue(any(item["code"] == "DIURNAL_DRIFT_WARNING" for item in broad["warnings"]))
+        edge = next(row for row in self.fetch_candidates(broad["processing_run_id"])
+                    if row["modis_observation_id"] is not None and row["viirs_observation_id"] is not None)
+        explanation = json.loads(edge["explanation_json"])
+        self.assertTrue(any(item["code"] == "DIURNAL_DRIFT_WARNING" for item in explanation["warnings"]))
+        with self.assertRaisesRegex(ValueError, "between 1 and 360"):
+            run_baseline_matching(self.repository, temporal_window_minutes=361)
+
+    def test_out_of_range_selected_platform_emits_diagnostic(self):
+        result = run_baseline_matching(
+            self.repository, start_date="2010-01-01", end_date="2010-01-02",
+            bbox="75.7,26.8,75.9,27.0", platforms=["NOAA-21"], window_preset=15,
+        )
+        self.assertTrue(any(item["code"] == "PLATFORM_OUT_OF_OPERATIONAL_RANGE" for item in result["warnings"]))
+
