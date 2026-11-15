@@ -14,12 +14,16 @@ from typing import Any, Iterable, Mapping
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Column,
     DateTime,
     Float,
     ForeignKey,
     Identity,
+    and_,
+    exists,
+    func,
     Index,
     Integer,
     MetaData,
@@ -149,6 +153,90 @@ idx_observations_dataset_time = Index("idx_observations_dataset_time", observati
 idx_observations_sensor_collection = Index("idx_observations_sensor_collection", observations.c.sensor, observations.c.collection)
 idx_observations_lat_lon = Index("idx_observations_lat_lon", observations.c.latitude, observations.c.longitude)
 idx_runs_dataset_status = Index("idx_runs_dataset_status", ingestion_runs.c.dataset_id, ingestion_runs.c.status)
+
+# SKH Master Documentation §6.10 — processing and analysis result entities.
+processing_runs = Table(
+    "processing_runs",
+    metadata,
+    Column("processing_run_id", Integer, Identity(), primary_key=True),
+    Column("module_name", String(24), nullable=False),
+    Column("method_version", String(64), nullable=False),
+    Column("configuration_json", Text, nullable=False),
+    Column("started_at", UTCDateTime(), nullable=False),
+    Column("completed_at", UTCDateTime(), nullable=True),
+    Column("input_count", Integer, nullable=False, server_default=text("0")),
+    Column("output_count", Integer, nullable=False, server_default=text("0")),
+    Column("status", String(24), nullable=False),
+    Column("error_message", Text, nullable=True),
+    CheckConstraint("module_name IN ('QC', 'OPPORTUNITY')", name="ck_processing_runs_module"),
+)
+idx_processing_runs_module_method = Index(
+    "idx_processing_runs_module_method",
+    processing_runs.c.module_name,
+    processing_runs.c.method_version,
+    processing_runs.c.status,
+)
+
+qc_results = Table(
+    "qc_results",
+    metadata,
+    Column("qc_result_id", Integer, Identity(), primary_key=True),
+    Column("observation_id", Integer, ForeignKey("observations.observation_id", ondelete="RESTRICT"), nullable=False),
+    Column("processing_run_id", Integer, ForeignKey("processing_runs.processing_run_id", ondelete="RESTRICT"), nullable=False),
+    Column("quality_status", String(32), nullable=False),
+    Column("suitability_for_matching", Boolean, nullable=False),
+    Column("suitability_for_frp", Boolean, nullable=False),
+    Column("warnings_json", Text, nullable=False),
+    Column("source_confidence_category", String(16), nullable=False),
+    Column("created_at", UTCDateTime(), nullable=False),
+    UniqueConstraint("processing_run_id", "observation_id", name="uq_qc_run_observation"),
+    CheckConstraint(
+        "quality_status IN ('VALID', 'VALID_WITH_WARNINGS', 'INVALID', 'INCOMPLETE', 'QUARANTINED')",
+        name="ck_qc_quality_status",
+    ),
+    CheckConstraint(
+        "source_confidence_category IN ('LOW', 'NOMINAL', 'HIGH', 'UNKNOWN')",
+        name="ck_qc_confidence_category",
+    ),
+)
+idx_qc_results_observation = Index("idx_qc_results_observation", qc_results.c.observation_id)
+idx_qc_results_run = Index("idx_qc_results_run", qc_results.c.processing_run_id)
+
+observation_opportunities = Table(
+    "observation_opportunities",
+    metadata,
+    Column("opportunity_id", Integer, Identity(), primary_key=True),
+    Column("processing_run_id", Integer, ForeignKey("processing_runs.processing_run_id", ondelete="RESTRICT"), nullable=False),
+    # Nullable for area/time summaries that have no matching detected observation.
+    Column("observation_id", Integer, ForeignKey("observations.observation_id", ondelete="RESTRICT"), nullable=True),
+    Column("sensor", String(16), nullable=False),
+    Column("platform", String(32), nullable=False),
+    Column("spatial_unit_id", String(128), nullable=False),
+    Column("time_window_start", UTCDateTime(), nullable=False),
+    Column("time_window_end", UTCDateTime(), nullable=False),
+    Column("opportunity_state", String(32), nullable=False),
+    Column("evidence_source", String(48), nullable=False),
+    Column("notes", Text, nullable=True),
+    Column("created_at", UTCDateTime(), nullable=False),
+    CheckConstraint("sensor IN ('MODIS', 'VIIRS')", name="ck_opportunity_sensor"),
+    CheckConstraint(
+        "opportunity_state IN ('DETECTED', 'VALID_NO_DETECTION', 'CLOUD_OBSCURED', "
+        "'INVALID_QUALITY', 'NOT_COVERED', 'UNKNOWN')",
+        name="ck_opportunity_state",
+    ),
+    CheckConstraint(
+        "evidence_source IN ('FIRMS_DETECTION_ONLY', 'LEVEL2_SWATH_MASK')",
+        name="ck_opportunity_evidence_source",
+    ),
+    CheckConstraint("time_window_end > time_window_start", name="ck_opportunity_time_window"),
+)
+idx_opportunities_lookup = Index(
+    "idx_opportunities_lookup",
+    observation_opportunities.c.sensor,
+    observation_opportunities.c.spatial_unit_id,
+    observation_opportunities.c.time_window_start,
+    observation_opportunities.c.time_window_end,
+)
 
 
 def resolve_database_url(value: str | Path | None = None) -> str:
@@ -471,6 +559,220 @@ class DatabaseRepository:
                 inserted += len(inserted_hashes)
         return inserted, len(rows) - inserted
 
+    # ---- SKH §6.6 / §6.7 / §6.10 processing repository methods ----
+    def create_processing_run(
+        self,
+        module_name: str,
+        method_version: str,
+        configuration_json: str,
+    ) -> int:
+        if module_name not in {"QC", "OPPORTUNITY"}:
+            raise ValueError("module_name must be 'QC' or 'OPPORTUNITY'")
+        statement = (
+            processing_runs.insert()
+            .values(
+                module_name=module_name,
+                method_version=method_version,
+                configuration_json=configuration_json,
+                started_at=datetime.now(timezone.utc),
+                input_count=0,
+                output_count=0,
+                status="RUNNING",
+            )
+            .returning(processing_runs.c.processing_run_id)
+        )
+        with self.engine.begin() as connection:
+            result = connection.execute(statement).scalar_one()
+        return int(result)
+
+    def finish_processing_run(
+        self,
+        processing_run_id: int,
+        *,
+        status: str,
+        input_count: int,
+        output_count: int,
+        error_message: str | None = None,
+    ) -> None:
+        if status not in {"COMPLETED", "FAILED", "PARTIAL"}:
+            raise ValueError("status must be COMPLETED, FAILED, or PARTIAL")
+        statement = (
+            update(processing_runs)
+            .where(processing_runs.c.processing_run_id == processing_run_id)
+            .values(
+                completed_at=datetime.now(timezone.utc),
+                input_count=input_count,
+                output_count=output_count,
+                status=status,
+                error_message=error_message,
+            )
+        )
+        with self.engine.begin() as connection:
+            result = connection.execute(statement)
+            if result.rowcount == 0:
+                raise KeyError(f"Processing run {processing_run_id} does not exist")
+
+    def fetch_unprocessed_observations(
+        self,
+        *,
+        method_version: str,
+        after_observation_id: int = 0,
+        limit: int = 1000,
+        reprocess: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Keyset-page observations not QC-processed by this method version."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        statement = (
+            select(observations)
+            .where(observations.c.observation_id > after_observation_id)
+            .order_by(observations.c.observation_id)
+            .limit(limit)
+        )
+        if not reprocess:
+            prior_qc = (
+                select(qc_results.c.qc_result_id)
+                .select_from(qc_results.join(
+                    processing_runs,
+                    qc_results.c.processing_run_id == processing_runs.c.processing_run_id,
+                ))
+                .where(
+                    qc_results.c.observation_id == observations.c.observation_id,
+                    processing_runs.c.module_name == "QC",
+                    processing_runs.c.method_version == method_version,
+                    processing_runs.c.status == "COMPLETED",
+                )
+            )
+            statement = statement.where(~exists(prior_qc))
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def insert_qc_results(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        payload = [dict(row) for row in rows]
+        if not payload:
+            return 0
+        now = datetime.now(timezone.utc)
+        for row in payload:
+            row.setdefault("created_at", now)
+        with self.engine.begin() as connection:
+            for offset in range(0, len(payload), INSERT_BATCH_SIZE):
+                connection.execute(qc_results.insert(), payload[offset:offset + INSERT_BATCH_SIZE])
+        return len(payload)
+
+    def fetch_observations_for_opportunity(
+        self,
+        *,
+        sensor: str,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+        start_at: datetime,
+        end_at: datetime,
+        qc_processing_run_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return observations with their latest completed QC result, if any."""
+        if qc_processing_run_id is None:
+            latest_qc_id = (
+                select(func.max(qc_results.c.qc_result_id))
+                .select_from(qc_results.join(
+                    processing_runs,
+                    qc_results.c.processing_run_id == processing_runs.c.processing_run_id,
+                ))
+                .where(
+                    qc_results.c.observation_id == observations.c.observation_id,
+                    processing_runs.c.module_name == "QC",
+                    processing_runs.c.status == "COMPLETED",
+                )
+                .correlate(observations)
+                .scalar_subquery()
+            )
+            qc_join = qc_results.c.qc_result_id == latest_qc_id
+        else:
+            qc_join = and_(
+                qc_results.c.observation_id == observations.c.observation_id,
+                qc_results.c.processing_run_id == qc_processing_run_id,
+            )
+
+        selected_columns = [observations.c[name] for name in observations.c.keys()]
+        selected_columns.extend([
+            qc_results.c.qc_result_id.label("qc_result_id"),
+            qc_results.c.processing_run_id.label("qc_processing_run_id"),
+            qc_results.c.quality_status.label("qc_quality_status"),
+            qc_results.c.suitability_for_matching.label("suitability_for_matching"),
+            qc_results.c.suitability_for_frp.label("suitability_for_frp"),
+            qc_results.c.warnings_json.label("qc_warnings_json"),
+            qc_results.c.source_confidence_category.label("source_confidence_category"),
+        ])
+        statement = (
+            select(*selected_columns)
+            .select_from(observations.outerjoin(qc_results, qc_join))
+            .where(
+                observations.c.sensor == sensor,
+                observations.c.longitude >= west,
+                observations.c.longitude <= east,
+                observations.c.latitude >= south,
+                observations.c.latitude <= north,
+                observations.c.acquired_at >= start_at,
+                observations.c.acquired_at < end_at,
+            )
+            .order_by(observations.c.acquired_at, observations.c.observation_id)
+        )
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def insert_opportunities(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        payload = [dict(row) for row in rows]
+        if not payload:
+            return 0
+        now = datetime.now(timezone.utc)
+        for row in payload:
+            row.setdefault("created_at", now)
+        with self.engine.begin() as connection:
+            for offset in range(0, len(payload), INSERT_BATCH_SIZE):
+                connection.execute(
+                    observation_opportunities.insert(),
+                    payload[offset:offset + INSERT_BATCH_SIZE],
+                )
+        return len(payload)
+
+    def get_opportunity_summary(
+        self,
+        *,
+        sensor: str,
+        spatial_unit_id: str,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> dict[str, Any]:
+        """Summarize the newest completed opportunity run for the exact query."""
+        latest_run = (
+            select(func.max(observation_opportunities.c.processing_run_id))
+            .select_from(observation_opportunities.join(
+                processing_runs,
+                observation_opportunities.c.processing_run_id == processing_runs.c.processing_run_id,
+            ))
+            .where(
+                observation_opportunities.c.sensor == sensor,
+                observation_opportunities.c.spatial_unit_id == spatial_unit_id,
+                observation_opportunities.c.time_window_start == start_at,
+                observation_opportunities.c.time_window_end == end_at,
+                processing_runs.c.module_name == "OPPORTUNITY",
+                processing_runs.c.status == "COMPLETED",
+            )
+            .scalar_subquery()
+        )
+        statement = (
+            select(
+                observation_opportunities.c.opportunity_state,
+                func.count().label("record_count"),
+            )
+            .where(observation_opportunities.c.processing_run_id == latest_run)
+            .group_by(observation_opportunities.c.opportunity_state)
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(statement).all()
+        return {row.opportunity_state: int(row.record_count) for row in rows}
+
     def count_observations(self) -> int:
         from sqlalchemy import func
         with self.engine.connect() as connection:
@@ -511,6 +813,7 @@ def connect_db(database_url: str | Path | None = None) -> DatabaseRepository:
         else:
             _migrate_additive_observation_columns(engine)
         _migrate_postgresql_timestamp_columns(engine)
+        metadata.create_all(engine, tables=[processing_runs, qc_results, observation_opportunities])
         for index in (
             idx_observations_acquired_at,
             idx_observations_dataset_time,
@@ -518,6 +821,10 @@ def connect_db(database_url: str | Path | None = None) -> DatabaseRepository:
             idx_observations_lat_lon,
             idx_runs_dataset_status,
             idx_raw_assets_sha256,
+            idx_processing_runs_module_method,
+            idx_qc_results_observation,
+            idx_qc_results_run,
+            idx_opportunities_lookup,
         ):
             index.create(engine, checkfirst=True)
         _backfill_raw_assets(engine)

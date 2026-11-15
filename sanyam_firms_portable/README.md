@@ -131,3 +131,87 @@ additive migration from the previous SQLite schema, source-field normalization,
 PostgreSQL DDL compilation (`IDENTITY`, `TIMESTAMP WITH TIME ZONE`) and
 PostgreSQL upsert SQL compilation. A live PostgreSQL connection test requires
 an actual test database and is not performed by the local SQLite test suite.
+
+## Module 4 — Quality Control and Module 5 — Observation Opportunity
+
+`qc_and_opportunity.py` implements the FIRMS-CSV versions of SKH Master
+Documentation §§6.6 and 6.7. The SQLAlchemy Core schema and repository methods
+for these modules live in `db.py`; both SQLite and PostgreSQL use the same
+repository API.
+
+New logical tables:
+
+- `processing_runs`: module, method version, JSON configuration, timestamps,
+  input/output counts and run status.
+- `qc_results`: immutable per-observation QC results linked to a processing run.
+- `observation_opportunities`: area/time/sensor/platform opportunity records,
+  with an optional `observation_id` for traceable positive detections.
+
+Run QC for observations not already processed by this QC method version:
+
+```bash
+python qc_and_opportunity.py qc
+```
+
+Re-run QC for all observations with a new immutable processing run:
+
+```bash
+python qc_and_opportunity.py qc --method-version 1.0.1 --reprocess
+```
+
+Evaluate FIRMS opportunity for a bounding box and inclusive UTC date range:
+
+```bash
+python qc_and_opportunity.py opportunity \
+  --sensor VIIRS \
+  --bbox 73,26,78,30 \
+  --start-date 2024-01-01 \
+  --end-date 2024-01-31
+```
+
+Query the latest stored opportunity summary for the same request:
+
+```bash
+python qc_and_opportunity.py summary \
+  --sensor VIIRS \
+  --bbox 73,26,78,30 \
+  --start-date 2024-01-01 \
+  --end-date 2024-01-31
+```
+
+For a non-default database, put the global option before the command:
+
+```bash
+python qc_and_opportunity.py \
+  --database-url "$DATABASE_URL" qc
+```
+
+QC never deletes source observations. It processes rows not yet evaluated by
+the selected `method_version`; `--reprocess` deliberately creates a new set of
+QC results instead of overwriting historical results. MODIS confidence is
+interpreted as numeric 0–100; VIIRS categorical labels are retained and mapped
+to LOW/NOMINAL/HIGH. Native `confidence_raw` is never modified. Missing or
+nonpositive FRP disables FRP suitability but does not disable point/time
+matching when coordinates and acquisition time are valid.
+
+The FIRMS opportunity provider is deliberately conservative. FIRMS CSVs
+contain positive hotspot rows but do not provide complete swath/cloud masks.
+Consequently, a zero-row area/time query produces `UNKNOWN`, never
+`VALID_NO_DETECTION`. An existing detection without a completed QC result is
+also `UNKNOWN`; a QC-failed detection is retained as `INVALID_QUALITY`.
+
+`OpportunityProvider` is the extension point for a future LAADS Level-2
+adapter. A provider with swath, pixel-mask, geolocation and product-quality
+evidence can write `VALID_NO_DETECTION`, `CLOUD_OBSCURED`, `NOT_COVERED` and
+`INVALID_QUALITY` using `evidence_source='LEVEL2_SWATH_MASK'` without changing
+the opportunity table or API record shape.
+
+## Full test suite
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The current suite covers ingestion plus Modules 4 and 5. PostgreSQL table DDL
+and dialect-specific schema properties are compiled in tests; a live PostgreSQL
+integration test still requires a reachable PostgreSQL test database.
