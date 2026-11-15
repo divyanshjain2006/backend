@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -95,13 +96,31 @@ class TestSANYAMAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_laads_ingest_endpoint_does_not_accept_or_echo_credentials(self):
-        response = self.client.post("/ingestion/laads/run", json={
-            "products": ["MOD14"], "start_date": "2024-01-01", "end_date": "2024-01-01",
-            "bbox": [73, 26, 78, 30],
-        })
-        # Test environment intentionally has no EARTHDATA_TOKEN.
+        # Patch the exact lookup performed by the endpoint. This remains
+        # deterministic even if load_dotenv() or a Codespaces secret populated
+        # EARTHDATA_TOKEN before the test began.
+        import api
+        real_getenv = api.os.getenv
+        with patch("api.os.getenv", side_effect=lambda key, default=None: "" if key == "EARTHDATA_TOKEN" else real_getenv(key, default)):
+            response = self.client.post("/ingestion/laads/run", json={
+                "products": ["MOD14"], "start_date": "2024-01-01", "end_date": "2024-01-01",
+                "bbox": [73, 26, 78, 30],
+            })
+        # The test explicitly removes a developer's local .env token so this
+        # remains deterministic even when the developer has Earthdata access.
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["detail"], "EARTHDATA_TOKEN is not configured on the server")
+
+    def test_grid_resolution_validation_accepts_only_supported_values(self):
+        base = {
+            "method": "BASELINE_HAVERSINE",
+            "start_date": "2024-01-01", "end_date": "2024-01-02",
+            "bbox": [73, 26, 78, 30],
+        }
+        accepted = self.client.post("/matching/run", json={**base, "grid_resolution_km": 2.0})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        rejected = self.client.post("/matching/run", json={**base, "grid_resolution_km": 1.5})
+        self.assertEqual(rejected.status_code, 422)
 
 
 if __name__ == "__main__":

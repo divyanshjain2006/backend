@@ -298,6 +298,8 @@ Existing destination granules are not downloaded over. `raw_assets` records the 
 - Native `FP_line` and `FP_sample` positions are treated as **zero-based** for MODIS C6.1 and VIIRS C2, matching the NASA product guides.
 - Pixel-level time is marked `LINEAR_INTERPOLATED_FROM_GRANULE_TIME_BOUNDS` when interpolated from the line position and granule start/end metadata. Where there are insufficient bounds it is marked `GRANULE_START_ONLY`; neither status should be presented as a native per-pixel UTC timestamp.
 
+The HDF4 reader selects each SDS by name and reads datasets independently. An unreadable **optional** SDS is skipped with an `HDF4_SDS_READ_FAILED` provenance warning retained in observation native attributes; this avoids discarding a usable granule because a non-essential diagnostic layer cannot be decoded. The `fire mask` SDS is mandatory, and the adapter rejects the granule if it is missing or unreadable. If `FirePix` is nonzero, the `FP_line`, `FP_sample`, `FP_latitude` and `FP_longitude` vectors are also mandatory and must contain enough rows to locate every sparse fire-pixel record. A missing required field is a granule error, never an empty/no-fire result.
+
 If the HDF4 reader fails to import `pyhdf`, install the required native HDF4 system libraries and reinstall `pyhdf`. Do not work around a decoder failure by silently treating the source file as a CSV.
 
 ---
@@ -708,3 +710,8 @@ When a product guide and this README differ, the product's official collection-s
 ## 15. Research-use disclaimer
 
 SANYAM is a research and engineering system, not an operational fire-warning service. Before publishing a scientific conclusion, preserve the selected source collections, filters, platform set, time threshold, processing run IDs, code version, raw asset checksums, geometry source and QC/opportunity evidence. Report uncertainty and avoid describing unmatched observations as proof that no fire existed.
+
+
+### Latest local regression verification
+
+The current source snapshot passes 105 `unittest` cases, including HDF4 optional-SDS failure handling, required fire-mask rejection, required fire-pixel geolocation-vector validation, and deterministic missing-Earthdata-token API behavior. This remains mocked/local regression coverage; validate the five product families against authentic granules before scientific production use.

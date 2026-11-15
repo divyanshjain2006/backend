@@ -40,8 +40,8 @@ from shapely.strtree import STRtree
 from shapely.ops import transform as transform_geometry
 from shapely.wkt import loads as load_wkt
 
-from db import DatabaseRepository, connect_db
-from qc_and_opportunity import BoundingBox
+from sanyam_firms_portable.db import DatabaseRepository, connect_db
+from sanyam_firms_portable.qc_and_opportunity import BoundingBox
 
 try:
     from dotenv import load_dotenv
@@ -124,19 +124,19 @@ def resolve_temporal_window(
 def _platform_diagnostics(platforms: Sequence[str] | None, start_at: datetime | None, end_at: datetime | None) -> list[dict[str, str]]:
     if not platforms or start_at is None or end_at is None:
         return []
-    from laads_ingest import platform_availability_diagnostics
+    from sanyam_firms_portable.laads_ingest import platform_availability_diagnostics
     return platform_availability_diagnostics(platforms, start_at, end_at)
 
 
 def _normalise_platforms(platforms: Sequence[str] | None) -> set[str] | None:
     if not platforms:
         return None
-    from laads_ingest import canonical_platform
+    from sanyam_firms_portable.laads_ingest import canonical_platform
     return {canonical_platform(value) for value in platforms}
 
 
 def _row_platform(row: Mapping[str, Any]) -> str:
-    from qc_and_opportunity import _platform_name
+    from sanyam_firms_portable.qc_and_opportunity import _platform_name
     return _platform_name(str(row.get("sensor") or ""), row.get("satellite"))
 
 

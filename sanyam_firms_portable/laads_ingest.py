@@ -32,7 +32,7 @@ from urllib.parse import urljoin, urlparse
 import numpy as np
 import requests
 
-from db import DatabaseRepository, connect_db
+from sanyam_firms_portable.db import DatabaseRepository, connect_db
 
 try:
     from dotenv import load_dotenv
@@ -394,6 +394,9 @@ def _normalise_fire_observation(
     source_hash = hashlib.sha256(source_key.encode("utf-8")).hexdigest()
     footprint = _pixel_footprint_wkt(arrays, max(0, line or 0), max(0, sample or 0))
     attrs_payload = {key: _safe_scalar(value) for key, value in field_values.items()}
+    decoder_warnings = attrs.get("_SDS_READ_WARNINGS") or []
+    if decoder_warnings:
+        attrs_payload["_decoder_warnings"] = decoder_warnings
     native_json = json.dumps(attrs_payload, sort_keys=True, separators=(",", ":"), default=str)
     raw_json = json.dumps({
         "source": "LAADS_LEVEL2", "granule_id": granule.granule_id, "product_id": product,
@@ -534,16 +537,56 @@ def decode_viirs_mask(fire_mask: Any, algorithm_qa: Any | None = None) -> dict[s
 
 
 def _read_hdf4(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read HDF4 SDS arrays while isolating unreadable optional datasets.
+
+    A granule may expose SDS metadata entries whose data blocks cannot be read
+    by the local HDF4/pyhdf build. Optional layer failures are retained as
+    provenance warnings. The fire mask is mandatory: without it, the granule
+    cannot establish Level-2 mask evidence and must be rejected.
+    """
     try:
         from pyhdf.SD import SD, SDC
     except ImportError as exc:
         raise LAADSError("pyhdf is required for MOD14/MYD14 HDF4 files; install the HDF4 system library and pyhdf") from exc
     handle = SD(str(path), SDC.READ)
     try:
-        arrays = {name: dataset.get() for name, dataset in handle.datasets().items()}
-        attrs = _native_attrs(handle.attributes())
-        # pyhdf global attrs can return numpy arrays; normalise singleton values.
-        attrs = {key: _safe_scalar(value) for key, value in attrs.items()}
+        arrays: dict[str, Any] = {}
+        read_warnings: list[dict[str, str]] = []
+        for name in handle.datasets():
+            dataset = None
+            try:
+                dataset = handle.select(name)
+                arrays[name] = dataset.get()
+            except Exception as exc:
+                read_warnings.append({
+                    "code": "HDF4_SDS_READ_FAILED",
+                    "dataset": str(name),
+                    "message": f"Could not read HDF4 SDS {name!r}: {type(exc).__name__}: {exc}",
+                })
+                LOG.warning("Could not read HDF4 SDS %s from %s: %s", name, path.name, exc)
+            finally:
+                if dataset is not None:
+                    endaccess = getattr(dataset, "endaccess", None)
+                    if callable(endaccess):
+                        try:
+                            endaccess()
+                        except Exception:
+                            LOG.debug("Could not close HDF4 SDS %s", name, exc_info=True)
+
+        if _lookup(arrays, "fire mask") is None:
+            failed_mask = any(
+                str(item["dataset"]).strip().lower().replace("_", " ") == "fire mask"
+                for item in read_warnings
+            )
+            reason = "could not be read" if failed_mask else "is absent"
+            raise LAADSError(
+                f"Required MODIS HDF4 'fire mask' SDS {reason}; "
+                "granule is not usable for Level-2 opportunity classification"
+            )
+
+        attrs = {key: _safe_scalar(value) for key, value in _native_attrs(handle.attributes()).items()}
+        if read_warnings:
+            attrs["_SDS_READ_WARNINGS"] = read_warnings
         return arrays, attrs
     finally:
         handle.end()
@@ -578,6 +621,42 @@ def _read_hdf5(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return arrays, attrs
 
 
+def _validate_fire_pixel_vectors(
+    sensor: str, vectors: Mapping[str, Any | None], attrs: Mapping[str, Any],
+) -> int:
+    """Validate the location/index vectors needed to map sparse fire rows to a mask.
+
+    If the product declares FirePix > 0, line/sample and center latitude/longitude
+    are mandatory. An unreadable vector must not silently turn a real detection
+    table into an empty granule or map pixels to the wrong mask cells.
+    """
+    latitude = vectors.get("FP_latitude")
+    observed_count = int(np.asarray(latitude).reshape(-1).size) if latitude is not None else 0
+    declared_value = _finite_float(attrs.get("FirePix"))
+    declared_count = int(declared_value) if declared_value is not None and declared_value >= 0 else 0
+    expected_count = max(observed_count, declared_count)
+    if expected_count <= 0:
+        return 0
+    required = ("FP_line", "FP_sample", "FP_latitude", "FP_longitude")
+    missing = [name for name in required if vectors.get(name) is None]
+    if missing:
+        raise LAADSError(
+            f"{sensor} Level-2 FirePix={expected_count} but required fire-pixel "
+            f"geolocation/index SDS are missing or unreadable: {', '.join(missing)}"
+        )
+    short = []
+    for name in required:
+        size = int(np.asarray(vectors[name]).reshape(-1).size)
+        if size < expected_count:
+            short.append(f"{name}={size}")
+    if short:
+        raise LAADSError(
+            f"{sensor} Level-2 fire-pixel vectors contain fewer than {expected_count} "
+            f"records: {', '.join(short)}"
+        )
+    return expected_count
+
+
 def extract_modis_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *, product: str, granule: GranuleName) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Pure array adapter used by pyhdf ingestion and mock-array unit tests."""
     mask = _lookup(arrays, "fire mask")
@@ -590,9 +669,7 @@ def extract_modis_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *
     decoded = decode_modis_mask(mask, qa)
     fields = ["FP_line", "FP_sample", "FP_latitude", "FP_longitude", "FP_power", "FP_T21", "FP_T31", "FP_MeanT21", "FP_MeanT31", "FP_confidence", "FP_AdjCloud", "FP_day", "FP_SolZenAng", "FP_scan", "FP_track"]
     vectors = {field: _lookup(arrays, field) for field in fields}
-    n = len(np.asarray(vectors["FP_latitude"]).reshape(-1)) if vectors["FP_latitude"] is not None else 0
-    if not n and int(_safe_scalar(attrs.get("FirePix", 0)) or 0) > 0:
-        raise LAADSError("MODIS granule FirePix metadata is nonzero but FP_latitude SDS is missing")
+    n = _validate_fire_pixel_vectors("MODIS", vectors, attrs)
     rows: list[dict[str, Any]] = []
     for i in range(n):
         item = {field: (np.asarray(value).reshape(-1)[i] if value is not None else None) for field, value in vectors.items()}
@@ -625,9 +702,7 @@ def extract_viirs_granule(arrays: Mapping[str, Any], attrs: Mapping[str, Any], *
     decoded = decode_viirs_mask(mask, qa)
     fields = ["FP_line", "FP_sample", "FP_latitude", "FP_longitude", "FP_power", "FP_T4", "FP_T5", "FP_MeanT4", "FP_MeanT5", "FP_AdjCloud", "FP_confidence", "FP_day", "FP_SolZenAng"]
     vectors = {field: _lookup(arrays, field) for field in fields}
-    n = len(np.asarray(vectors["FP_latitude"]).reshape(-1)) if vectors["FP_latitude"] is not None else 0
-    if not n and int(_safe_scalar(attrs.get("FirePix", 0)) or 0) > 0:
-        raise LAADSError("VIIRS granule FirePix metadata is nonzero but FP_latitude is missing")
+    n = _validate_fire_pixel_vectors("VIIRS", vectors, attrs)
     rows: list[dict[str, Any]] = []
     for i in range(n):
         item = {field: (np.asarray(value).reshape(-1)[i] if value is not None else None) for field, value in vectors.items()}

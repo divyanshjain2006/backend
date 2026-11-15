@@ -21,27 +21,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from db import DatabaseRepository, connect_db
-from laads_ingest import (
+from sanyam_firms_portable.db import DatabaseRepository, connect_db
+from sanyam_firms_portable.laads_ingest import (
     LAADSClient,
     PRODUCTS,
     canonical_platform,
     ingest_laads,
     platform_availability_diagnostics,
 )
-from matching_and_measurement import (
+from sanyam_firms_portable.matching_and_measurement import (
     build_common_grid_summary,
     export_validation_geojson,
     run_baseline_matching,
     run_footprint_matching,
     analyze_frp_measurements,
 )
-from qc_and_opportunity import (
+from sanyam_firms_portable.qc_and_opportunity import (
     Level2SwathOpportunityProvider,
     evaluate_observation_opportunity,
     query_opportunity_summary,
     run_quality_control,
 )
+
+ALLOWED_GRID_RESOLUTIONS_KM = (1.0, 2.0, 5.0)
+
+
+def _validate_grid_resolution(value: float | None) -> float | None:
+    """Restrict grid resolutions to the scientifically supported presets."""
+    if value is None:
+        return None
+    numeric = float(value)
+    if numeric not in ALLOWED_GRID_RESOLUTIONS_KM:
+        allowed = ", ".join(str(item) for item in ALLOWED_GRID_RESOLUTIONS_KM)
+        raise ValueError(f"grid_resolution_km must be one of: {allowed}")
+    return numeric
+
 
 PLATFORM_DETAILS: dict[str, dict[str, Any]] = {
     "Terra": {"sensor": "MODIS", "product": "MOD14", "collection": "61", "active_from": "2000-02-24", "active_to": None},
@@ -178,8 +192,13 @@ class MatchingRunRequest(BaseModel):
     max_distance_km: float = Field(default=2.0, gt=0)
     max_boundary_distance_km: float = Field(default=0.25, ge=0)
     data_source_mode: Literal["FIRMS", "LAADS_LEVEL2", "BOTH"] = "BOTH"
-    grid_resolution_km: Literal[1.0, 2.0, 5.0] | None = None
+    grid_resolution_km: float | None = Field(default=None, ge=1.0, le=5.0)
     qc_processing_run_id: int | None = None
+
+    @field_validator("grid_resolution_km")
+    @classmethod
+    def validate_grid_resolution(cls, value: float | None) -> float | None:
+        return _validate_grid_resolution(value)
 
     @field_validator("bbox")
     @classmethod
@@ -209,11 +228,16 @@ class AggregationRunRequest(BaseModel):
     bbox: list[float] = Field(min_length=4, max_length=4)
     start_date: date
     end_date: date
-    grid_resolution_km: Literal[1.0, 2.0, 5.0] = 1.0
+    grid_resolution_km: float = Field(default=1.0, ge=1.0, le=5.0)
     period_days: int = Field(default=1, ge=1, le=366)
     matching_run_id: int | None = None
     platforms: list[str] | None = None
     data_source_mode: Literal["FIRMS", "LAADS_LEVEL2", "BOTH"] = "BOTH"
+
+    @field_validator("grid_resolution_km")
+    @classmethod
+    def validate_grid_resolution(cls, value: float) -> float:
+        return float(_validate_grid_resolution(value))
 
     @field_validator("bbox")
     @classmethod
@@ -361,7 +385,7 @@ def create_app(repository_factory: Callable[..., DatabaseRepository] = connect_d
                 start_at=start_at, end_at=end_at,
             )
             if platforms:
-                from qc_and_opportunity import _platform_name
+                from sanyam_firms_portable.qc_and_opportunity import _platform_name
                 allowed = {canonical_platform(x) for x in platforms}
                 rows = [r for r in rows if _platform_name(sensor, r.get("satellite")) in allowed]
             rows = rows[:limit]
@@ -380,7 +404,7 @@ def create_app(repository_factory: Callable[..., DatabaseRepository] = connect_d
             provider = None
             source_mode = "FIRMS"
             if request.evidence_mode == "LEVEL2":
-                from laads_ingest import iter_level2_swaths_for_opportunity
+                from sanyam_firms_portable.laads_ingest import iter_level2_swaths_for_opportunity
                 provider = Level2SwathOpportunityProvider(
                     iter_level2_swaths_for_opportunity(
                         repository, sensor=request.sensor, start_at=start_at, end_at=end_at,

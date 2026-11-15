@@ -37,7 +37,7 @@ from typing import Any, Iterable
 
 import requests
 
-from db import DEFAULT_DATABASE_URL, DatabaseRepository, connect_db
+from sanyam_firms_portable.db import DEFAULT_DATABASE_URL, DatabaseRepository, connect_db
 
 try:
     from dotenv import load_dotenv

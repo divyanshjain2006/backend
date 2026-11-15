@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import sys
+import types
 from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +13,112 @@ from db import connect_db
 
 
 class TestLAADSProductAndDecode(unittest.TestCase):
+    def test_hdf4_reader_selects_sds_by_name_from_metadata_dictionary(self):
+        arrays = {
+            "fire mask": np.array([[5, 8]], dtype=np.uint8),
+            "FP_latitude": np.array([27.0]),
+        }
+        class FakeDataset:
+            def __init__(self, value):
+                self.value = value
+                self.closed = False
+            def get(self):
+                return self.value
+            def endaccess(self):
+                self.closed = True
+        datasets = {name: FakeDataset(value) for name, value in arrays.items()}
+        class FakeSD:
+            def __init__(self, _path, _mode):
+                self.closed = False
+            def datasets(self):
+                # pyhdf returns name -> (index, dimensions, type, attr_count)
+                return {name: (i, value.shape, 0, 0) for i, (name, value) in enumerate(arrays.items())}
+            def select(self, name):
+                return datasets[name]
+            def attributes(self):
+                return {"CoreMetadata.0": "metadata"}
+            def end(self):
+                self.closed = True
+        fake_pyhdf = types.ModuleType("pyhdf")
+        fake_sd = types.ModuleType("pyhdf.SD")
+        fake_sd.SD = FakeSD
+        fake_sd.SDC = types.SimpleNamespace(READ=1)
+        fake_pyhdf.SD = fake_sd
+        with patch.dict(sys.modules, {"pyhdf": fake_pyhdf, "pyhdf.SD": fake_sd}):
+            decoded, _attrs = li._read_hdf4(Path("mock.hdf"))
+        self.assertEqual(set(decoded), set(arrays))
+        np.testing.assert_array_equal(decoded["fire mask"], arrays["fire mask"])
+        self.assertTrue(all(dataset.closed for dataset in datasets.values()))
+
+    def test_hdf4_reader_skips_unreadable_optional_sds_and_records_warning(self):
+        arrays = {
+            "fire mask": np.array([[5, 8]], dtype=np.uint8),
+            "FP_latitude": np.array([27.0]),
+        }
+        class FakeDataset:
+            def __init__(self, value=None, error=None):
+                self.value = value
+                self.error = error
+            def get(self):
+                if self.error:
+                    raise ValueError(self.error)
+                return self.value
+            def endaccess(self):
+                return None
+        datasets = {
+            "fire mask": FakeDataset(arrays["fire mask"]),
+            "FP_latitude": FakeDataset(arrays["FP_latitude"]),
+            "optional diagnostic layer": FakeDataset(error="SDreaddata failure"),
+        }
+        class FakeSD:
+            def __init__(self, _path, _mode):
+                pass
+            def datasets(self):
+                return {name: (i, (), 0, 0) for i, name in enumerate(datasets)}
+            def select(self, name):
+                return datasets[name]
+            def attributes(self):
+                return {"CoreMetadata.0": "metadata"}
+            def end(self):
+                return None
+        fake_pyhdf = types.ModuleType("pyhdf")
+        fake_sd = types.ModuleType("pyhdf.SD")
+        fake_sd.SD = FakeSD
+        fake_sd.SDC = types.SimpleNamespace(READ=1)
+        fake_pyhdf.SD = fake_sd
+        with patch.dict(sys.modules, {"pyhdf": fake_pyhdf, "pyhdf.SD": fake_sd}):
+            decoded, attrs = li._read_hdf4(Path("mock.hdf"))
+        self.assertIn("fire mask", decoded)
+        self.assertNotIn("optional diagnostic layer", decoded)
+        self.assertEqual(attrs["_SDS_READ_WARNINGS"][0]["code"], "HDF4_SDS_READ_FAILED")
+        self.assertEqual(attrs["_SDS_READ_WARNINGS"][0]["dataset"], "optional diagnostic layer")
+
+    def test_hdf4_reader_rejects_unreadable_required_fire_mask(self):
+        class FakeDataset:
+            def get(self):
+                raise ValueError("SDreaddata failure")
+            def endaccess(self):
+                return None
+        class FakeSD:
+            def __init__(self, _path, _mode):
+                pass
+            def datasets(self):
+                return {"fire mask": (0, (2, 2), 0, 0)}
+            def select(self, _name):
+                return FakeDataset()
+            def attributes(self):
+                return {}
+            def end(self):
+                return None
+        fake_pyhdf = types.ModuleType("pyhdf")
+        fake_sd = types.ModuleType("pyhdf.SD")
+        fake_sd.SD = FakeSD
+        fake_sd.SDC = types.SimpleNamespace(READ=1)
+        fake_pyhdf.SD = fake_sd
+        with patch.dict(sys.modules, {"pyhdf": fake_pyhdf, "pyhdf.SD": fake_sd}):
+            with self.assertRaisesRegex(li.LAADSError, "Required MODIS HDF4 'fire mask' SDS could not be read"):
+                li._read_hdf4(Path("broken.hdf"))
+
     def test_product_catalog_has_expected_products_and_collections(self):
         self.assertEqual(set(li.PRODUCTS), {"MOD14", "MYD14", "VNP14IMG", "VJ114IMG", "VJ214IMG"})
         self.assertEqual(li.PRODUCTS["MOD14"]["collection"], "61")
@@ -90,6 +198,18 @@ class TestLAADSProductAndDecode(unittest.TestCase):
         self.assertEqual(mask_data["fire_mask"].shape, (2, 2))
         self.assertEqual(mask_data["decoded_mask"]["fire"].sum(), 2)
 
+    def test_modis_adapter_rejects_missing_required_geolocation_vector(self):
+        granule = li.parse_granule_filename("MOD14.A2024001.0000.061.2024001000000.hdf")
+        arrays = {
+            "fire mask": np.array([[8]], dtype=np.uint8),
+            "FP_latitude": np.array([26.9]),
+            "FP_line": np.array([0]),
+            "FP_sample": np.array([0]),
+            # FP_longitude intentionally absent: a detection cannot be located.
+        }
+        with self.assertRaisesRegex(li.LAADSError, "FP_longitude"):
+            li.extract_modis_granule(arrays, {"FirePix": 1}, product="MOD14", granule=granule)
+
     def test_viirs_array_adapter_retains_full_mask_and_fire_pixel_attributes(self):
         granule = li.parse_granule_filename("VNP14IMG.A2024001.0000.002.2024001000000.nc")
         arrays = {
@@ -112,6 +232,18 @@ class TestLAADSProductAndDecode(unittest.TestCase):
         self.assertEqual(float(rows[1]["fields"]["FP_MeanT4"]), 315.0)
         self.assertEqual(mask_data["fire_mask"].shape, (2, 2))
         self.assertEqual(mask_data["decoded_mask"]["fire"].sum(), 3)
+
+    def test_viirs_adapter_rejects_missing_required_geolocation_vector(self):
+        granule = li.parse_granule_filename("VNP14IMG.A2024001.0000.002.2024001000000.nc")
+        arrays = {
+            "fire mask": np.array([[8]], dtype=np.uint8),
+            "FP_latitude": np.array([26.9]),
+            "FP_longitude": np.array([75.8]),
+            "FP_line": np.array([0]),
+            # FP_sample intentionally absent.
+        }
+        with self.assertRaisesRegex(li.LAADSError, "FP_sample"):
+            li.extract_viirs_granule(arrays, {"FirePix": 1}, product="VNP14IMG", granule=granule)
 
     def test_level2_line_interpolation_uses_zero_based_scanline_indices(self):
         start = datetime(2024, 1, 1, tzinfo=timezone.utc)

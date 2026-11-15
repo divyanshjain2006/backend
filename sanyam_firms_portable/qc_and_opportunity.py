@@ -25,7 +25,7 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from db import DatabaseRepository, connect_db
+from sanyam_firms_portable.db import DatabaseRepository, connect_db
 
 try:
     from dotenv import load_dotenv
@@ -652,10 +652,10 @@ def classify_level2_swath_opportunity(
         )
 
     if sensor_value == "VIIRS":
-        from laads_ingest import decode_viirs_mask
+        from sanyam_firms_portable.laads_ingest import decode_viirs_mask
         decoded = decode_viirs_mask(mask, algorithm_qa)
     else:
-        from laads_ingest import decode_modis_mask
+        from sanyam_firms_portable.laads_ingest import decode_modis_mask
         decoded = decode_modis_mask(mask, algorithm_qa)
 
     # Construct query polygon and pixel areas in a local equal-area CRS.
@@ -773,7 +773,7 @@ class Level2SwathOpportunityProvider:
         sensor: str, platform_filter: str | Sequence[str] | None,
         spatial_unit_id: str, start_at: datetime, end_at: datetime,
     ) -> list[dict[str, Any]]:
-        from laads_ingest import canonical_platform
+        from sanyam_firms_portable.laads_ingest import canonical_platform
         filters = platform_filter if isinstance(platform_filter, (list, tuple, set)) else ([platform_filter] if platform_filter else None)
         allowed = {canonical_platform(item) for item in filters} if filters else None
         base = {
@@ -1075,7 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
             provider = None
             data_source_mode = "FIRMS"
             if args.evidence_mode == "LEVEL2":
-                from laads_ingest import iter_level2_swaths_for_opportunity
+                from sanyam_firms_portable.laads_ingest import iter_level2_swaths_for_opportunity
                 provider = Level2SwathOpportunityProvider(
                     iter_level2_swaths_for_opportunity(
                         repository, sensor=args.sensor,
