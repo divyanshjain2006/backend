@@ -1045,7 +1045,18 @@ def iter_level2_swaths_for_opportunity(
             continue
         try:
             granule = parse_granule_filename(path.name)
-            observations, mask_data, info = _extract_file(path, product, granule)
+            # Opportunity evaluation needs the native mask, QA and any
+            # explicitly stored pixel-corner arrays. It does not need every
+            # full-swath science layer or a precomputed set of full-size
+            # boolean masks. Keep the decoder in sparse mode here as well as
+            # during initial ingestion; otherwise Level-2 opportunity runs can
+            # materialize several redundant VIIRS swath arrays and exhaust a
+            # memory-limited Codespace.
+            observations, mask_data, info = _extract_file(
+                path, product, granule,
+                decode_full_mask=False,
+                sparse_ingest=True,
+            )
             arrays = info["_arrays"]
             corner_latitude = _lookup(arrays, "latitude_corners", "pixel_corner_latitude", "corner_latitude")
             corner_longitude = _lookup(arrays, "longitude_corners", "pixel_corner_longitude", "corner_longitude")

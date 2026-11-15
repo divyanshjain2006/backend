@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-import sanyam_firms_portable.laads_ingest as li
+import laads_ingest as li
 from db import connect_db
 
 
@@ -508,6 +508,50 @@ class TestLAADSClient(unittest.TestCase):
 
 
 class TestLAADSIngestionPersistence(unittest.TestCase):
+    def test_opportunity_iterator_uses_sparse_viirs_reader_without_full_mask_decode(self):
+        filename = "VNP14IMG.A2024001.0000.002.2024001000000.nc"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / filename
+            path.write_bytes(b"mock VIIRS granule")
+
+            class FakeRepository:
+                def fetch_raw_assets(self, **kwargs):
+                    self.kwargs = kwargs
+                    return [{
+                        "product_id": "VNP14IMG",
+                        "storage_uri": str(path),
+                        "platform": "Suomi-NPP",
+                        "granule_id": filename,
+                        "collection_id": "002",
+                        "raw_asset_id": 7,
+                        "sha256": "abc123",
+                        "acquisition_start": datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+                        "acquisition_end": datetime(2024, 1, 1, 0, 6, tzinfo=timezone.utc),
+                    }]
+
+            repository = FakeRepository()
+            mask = np.array([[5, 8], [4, 5]], dtype=np.uint8)
+            arrays = {"latitude_corners": None, "longitude_corners": None}
+            with patch.object(
+                li, "_extract_file",
+                return_value=([], {"fire_mask": mask, "algorithm_qa": None}, {"_arrays": arrays}),
+            ) as extract:
+                records = list(li.iter_level2_swaths_for_opportunity(
+                    repository,
+                    sensor="VIIRS",
+                    start_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    end_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                    bbox=[73, 26, 78, 30],
+                    platforms=["Suomi-NPP"],
+                ))
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["platform"], "Suomi-NPP")
+            self.assertIs(records[0]["fire_mask"], mask)
+            self.assertIsNone(records[0]["corner_latitude"])
+            self.assertEqual(extract.call_args.kwargs["decode_full_mask"], False)
+            self.assertEqual(extract.call_args.kwargs["sparse_ingest"], True)
+
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)

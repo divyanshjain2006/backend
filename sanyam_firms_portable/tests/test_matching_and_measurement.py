@@ -31,8 +31,28 @@ from matching_and_measurement import (
     haversine_distance_km,
     run_baseline_matching,
     run_footprint_matching,
+    _build_parser,
 )
 from qc_and_opportunity import run_quality_control
+
+
+class TestMatchingCLI(unittest.TestCase):
+    def test_grid_cli_accepts_platform_and_data_source_options(self):
+        args = _build_parser().parse_args([
+            "grid",
+            "--bbox", "73,26,78,30",
+            "--start-date", "2024-01-01",
+            "--end-date", "2024-01-05",
+            "--resolution-km", "1.0",
+            "--period-days", "1",
+            "--matching-run-id", "8",
+            "--platforms", "Terra,NOAA-20",
+            "--data-source-mode", "LAADS_LEVEL2",
+        ])
+        self.assertEqual(args.command, "grid")
+        self.assertEqual(args.matching_run_id, 8)
+        self.assertEqual(args.platforms, "Terra,NOAA-20")
+        self.assertEqual(args.data_source_mode, "LAADS_LEVEL2")
 
 
 class SyntheticLevel2Provider:

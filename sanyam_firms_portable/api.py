@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from db import DatabaseRepository, connect_db
-from sanyam_firms_portable.laads_ingest import (
+from laads_ingest import (
     LAADSClient,
     PRODUCTS,
     canonical_platform,
@@ -404,7 +404,7 @@ def create_app(repository_factory: Callable[..., DatabaseRepository] = connect_d
             provider = None
             source_mode = "FIRMS"
             if request.evidence_mode == "LEVEL2":
-                from sanyam_firms_portable.laads_ingest import iter_level2_swaths_for_opportunity
+                from laads_ingest import iter_level2_swaths_for_opportunity
                 provider = Level2SwathOpportunityProvider(
                     iter_level2_swaths_for_opportunity(
                         repository, sensor=request.sensor, start_at=start_at, end_at=end_at,
