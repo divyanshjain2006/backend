@@ -201,7 +201,7 @@ python -m unittest discover -s tests -p 'test_matching_and_measurement.py' -v
 python -m unittest discover -s tests -p 'test_api.py' -v
 ```
 
-The current source snapshot was verified locally with `python -m compileall -q .` and **99 tests passing** using `python -m unittest discover -s tests -q`. This is the test status of the source snapshot used to prepare this README, not a claim that your separate Codespace has already run them. Live Earthdata/LAADS downloads are not part of the deterministic unit tests.
+The current source snapshot was verified locally with `python -m compileall -q .` and **105 tests passing** using `python -m unittest discover -s tests -q`. This is the test status of the source snapshot used to prepare this README, not a claim that your separate Codespace has already run them. Live Earthdata/LAADS downloads are not part of the deterministic unit tests.
 
 The tests exercise, among other things:
 
@@ -715,3 +715,298 @@ SANYAM is a research and engineering system, not an operational fire-warning ser
 ### Latest local regression verification
 
 The current source snapshot passes 105 `unittest` cases, including HDF4 optional-SDS failure handling, required fire-mask rejection, required fire-pixel geolocation-vector validation, and deterministic missing-Earthdata-token API behavior. This remains mocked/local regression coverage; validate the five product families against authentic granules before scientific production use.
+
+---
+
+## Appendix A. End-to-end runbook and verification checklist
+
+This section gives a practical order for running a fresh local/Codespaces copy. Run commands from the repository root with the virtual environment active. Replace dates, bbox and credentials with the study values you intend to use.
+
+### A1. Prepare the environment
+
+```bash
+cd /workspaces/experiment-1/sanyam_firms_portable
+
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+
+cp .env.example .env
+mkdir -p data/raw/modis/terra data/raw/modis/aqua \
+  data/raw/viirs/snpp data/raw/viirs/noaa20 data/raw/viirs/noaa21 \
+  data/exports
+```
+
+Edit `.env` with your own keys. Do not paste secrets into terminal screenshots, GitHub, issue trackers or chat messages. If `.env` already exists, do not overwrite it with the example.
+
+### A2. Run static/import/test verification before downloading data
+
+```bash
+python -m compileall -q .
+python -c "import db, firms_ingest, laads_ingest, qc_and_opportunity, matching_and_measurement, api; print('ALL IMPORTS OK')"
+python -m unittest discover -s tests -v
+```
+
+The current supplied source archive was locally verified with **105 passing `unittest` tests**. This is a baseline for that archive; run the commands above in your own Codespace to verify the files you actually extracted.
+
+Run a single test module when diagnosing a failure:
+
+```bash
+python -m unittest discover -s tests -p 'test_firms_ingest.py' -v
+python -m unittest discover -s tests -p 'test_laads_ingest.py' -v
+python -m unittest discover -s tests -p 'test_qc_and_opportunity.py' -v
+python -m unittest discover -s tests -p 'test_matching_and_measurement.py' -v
+python -m unittest discover -s tests -p 'test_api.py' -v
+```
+
+### A3. Ingest a small LAADS Level-2 sample
+
+Confirm `.env` contains `EARTHDATA_TOKEN`. Start with one product and a short date interval so that the first real-file test is easy to inspect.
+
+```bash
+python laads_ingest.py ingest \
+  --products MOD14 \
+  --start-date 2024-01-01 \
+  --end-date 2024-01-02 \
+  --bbox 73,26,78,30
+```
+
+Then test the other product families in separate, controlled runs:
+
+```bash
+python laads_ingest.py ingest --products MYD14    --start-date 2024-01-01 --end-date 2024-01-02 --bbox 73,26,78,30
+python laads_ingest.py ingest --products VNP14IMG --start-date 2024-01-01 --end-date 2024-01-02 --bbox 73,26,78,30
+python laads_ingest.py ingest --products VJ114IMG --start-date 2024-01-01 --end-date 2024-01-02 --bbox 73,26,78,30
+python laads_ingest.py ingest --products VJ214IMG --start-date 2024-01-01 --end-date 2024-01-02 --bbox 73,26,78,30
+```
+
+An archive search may legitimately return zero granules for a product/date/bbox. Check the returned JSON for the per-product status, discovered/downloaded counts, decoded observation count and rejection/error details. A successful mocked unit test is not proof that a live granule has been decoded correctly.
+
+### A4. (Optional) Ingest FIRMS CSV observations as a parallel source
+
+The FIRMS pipeline remains independent and uses `FIRMS_MAP_KEY`.
+
+```bash
+python firms_ingest.py availability
+python firms_ingest.py status
+python firms_ingest.py ingest \
+  --start-date 2024-01-01 \
+  --end-date 2024-01-05 \
+  --bbox 73,26,78,30 \
+  --mode sp-only \
+  --chunk-days 1
+python firms_ingest.py status
+```
+
+The `--mode auto` option prefers Standard Processing and can fall back to Near Real-Time only for dates without SP coverage. NRT is provisional and should be explicitly retained/labeled in any research analysis. Manual NRT sources require the `--allow-nrt` switch.
+
+### A5. Quality control
+
+Run QC after ingestion:
+
+```bash
+python qc_and_opportunity.py qc
+```
+
+The command processes observations that do not yet have a QC result for the selected method version. To deliberately create a new versioned QC assessment for all observations:
+
+```bash
+python qc_and_opportunity.py qc --reprocess
+```
+
+### A6. Observation opportunity
+
+For FIRMS detection-only evidence, run the sensor families separately:
+
+```bash
+python qc_and_opportunity.py opportunity \
+  --sensor MODIS --platforms Terra,Aqua --evidence-mode FIRMS \
+  --bbox 73,26,78,30 --start-date 2024-01-01 --end-date 2024-01-05
+
+python qc_and_opportunity.py opportunity \
+  --sensor VIIRS --platforms Suomi-NPP,NOAA-20,NOAA-21 --evidence-mode FIRMS \
+  --bbox 73,26,78,30 --start-date 2024-01-01 --end-date 2024-01-05
+```
+
+For Level-2 swath/mask evidence, use `--evidence-mode LEVEL2` and select platforms from only the matching sensor family:
+
+```bash
+python qc_and_opportunity.py opportunity \
+  --sensor MODIS --platforms Terra,Aqua --evidence-mode LEVEL2 \
+  --bbox 73,26,78,30 --start-date 2024-01-01 --end-date 2024-01-05
+
+python qc_and_opportunity.py opportunity \
+  --sensor VIIRS --platforms NOAA-20,NOAA-21 --evidence-mode LEVEL2 \
+  --bbox 73,26,78,30 --start-date 2024-01-01 --end-date 2024-01-05
+```
+
+Read the `UNKNOWN` and `NOT_COVERED` states carefully. If pixel-corner geolocation or granule time bounds are absent, the mask cannot prove valid non-detection for the query area/time. The adapter must not turn a missing or unreadable fire mask into a clear-land state.
+
+### A7. Run MODIS–VIIRS matching
+
+Baseline centre-distance matching (example threshold: 2 km and 30 minutes):
+
+```bash
+python matching_and_measurement.py baseline \
+  --start-date 2024-01-01 --end-date 2024-01-05 \
+  --bbox 73,26,78,30 \
+  --max-distance-km 2.0 \
+  --window-preset 30 \
+  --platforms Terra,NOAA-20 \
+  --data-source-mode BOTH
+```
+
+Footprint-aware matching:
+
+```bash
+python matching_and_measurement.py footprint \
+  --bbox 73,26,78,30 \
+  --start-date 2024-01-01 --end-date 2024-01-05 \
+  --window-preset 30 \
+  --platforms Terra,NOAA-20 \
+  --data-source-mode BOTH \
+  --max-boundary-km 0.25
+```
+
+Custom temporal threshold example (45 minutes):
+
+```bash
+python matching_and_measurement.py baseline \
+  --start-date 2024-01-01 --end-date 2024-01-05 \
+  --bbox 73,26,78,30 \
+  --custom-window-minutes 45 \
+  --platforms Terra,NOAA-20 \
+  --data-source-mode LAADS_LEVEL2
+```
+
+Select at least one MODIS and one VIIRS platform for cross-sensor matching. Presets are 5, 15, 30, 60 and 120 minutes; custom windows are 1–360 minutes. Do not pass both a preset and a custom window. A window above 60 minutes triggers a `DIURNAL_DRIFT_WARNING` in the candidate explanation.
+
+The query's UTC date interval is expanded by the selected temporal threshold on both sides before candidate pairing. The actual time difference is computed from continuous timezone-aware UTC timestamps. This allows a pair such as 23:55Z and 00:05Z next day to be assessed as a ten-minute pair. The padded records do not redefine the calendar day; cross-midnight groups are assigned to their earliest candidate timestamp for calendar display.
+
+### A8. FRP diagnostics
+
+```bash
+python matching_and_measurement.py frp \
+  --start-date 2024-01-01 --end-date 2024-01-05 \
+  --bbox 73,26,78,30
+```
+
+This step preserves each sensor's native FRP and creates diagnostics. It is not a complete cross-sensor FRP calibration or implementation of the full Sofiev & Kouznetsov (2026) observation operator.
+
+### A9. Common grid, run IDs and GeoJSON export
+
+Build a 1 km grid and explicitly link it to a matching run. Replace `MATCHING_RUN_ID` with the ID returned by the matching command:
+
+```bash
+python matching_and_measurement.py grid \
+  --bbox 73,26,78,30 \
+  --start-date 2024-01-01 --end-date 2024-01-05 \
+  --resolution-km 1.0 \
+  --period-days 1 \
+  --matching-run-id MATCHING_RUN_ID \
+  --platforms Terra,NOAA-20 \
+  --data-source-mode BOTH
+```
+
+List the generated runs:
+
+```bash
+python matching_and_measurement.py runs --module QC --limit 20
+python matching_and_measurement.py runs --module OPPORTUNITY --limit 20
+python matching_and_measurement.py runs --module MATCHING --limit 20
+python matching_and_measurement.py runs --module MEASUREMENT --limit 20
+python matching_and_measurement.py runs --module AGGREGATION --limit 20
+```
+
+Export using the **AGGREGATION processing run ID** (not the matching run ID):
+
+```bash
+python matching_and_measurement.py export \
+  --processing-run-id AGGREGATION_RUN_ID \
+  --output-dir data/exports/validation/run_AGGREGATION_RUN_ID
+```
+
+Check files:
+
+```bash
+find data/exports/validation/run_AGGREGATION_RUN_ID -maxdepth 2 -type f -print
+```
+
+If the grid run was created without `--matching-run-id`, its aggregation output cannot automatically include links to a previous matching run. Rerun the grid with the intended matching ID if that relationship is needed.
+
+### A10. Verify raw data, database tables and processing outputs
+
+Check that raw files exist and are non-empty:
+
+```bash
+find data/raw -type f \( -name '*.hdf' -o -name '*.nc' -o -name '*.h5' \) -printf '%s bytes  %p\n'
+```
+
+Check database tables and row counts through SQLAlchemy (works for SQLite and PostgreSQL URLs):
+
+```bash
+python - <<'PY'
+from sqlalchemy import inspect, text
+from db import connect_db
+
+repo = connect_db()
+try:
+    inspector = inspect(repo.engine)
+    expected = [
+        "ingestion_runs", "raw_assets", "observations", "processing_runs",
+        "qc_results", "observation_opportunities", "candidate_associations",
+        "measurement_results", "aggregation_results",
+    ]
+    present = set(inspector.get_table_names())
+    print("Database:", repo.display_target)
+    for table in expected:
+        if table not in present:
+            print(f"{table:32s} MISSING")
+            continue
+        with repo.engine.connect() as conn:
+            count = conn.execute(text(f'SELECT COUNT(*) FROM "{table}"')).scalar_one()
+        print(f"{table:32s} {count:>10,d} rows")
+finally:
+    repo.close()
+PY
+```
+
+A table with zero rows is not necessarily a failure: a query can legitimately return no detections or no qualifying candidates. Confirm the relevant upstream run status, raw file presence, product/time/bbox filters and provenance before concluding that a dataset is empty.
+
+### A11. Verify FastAPI
+
+Start the API:
+
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+```
+
+In another terminal:
+
+```bash
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS http://127.0.0.1:8000/platforms
+curl -fsS http://127.0.0.1:8000/openapi.json -o /tmp/sanyam-openapi.json
+```
+
+Open `http://localhost:8000/docs` (or the forwarded Codespaces port URL). The API obtains `EARTHDATA_TOKEN` and `FIRMS_MAP_KEY` from its server-side environment only; never put secrets in request JSON.
+
+### A12. Capture a reproducible validation record
+
+For every scientific run, retain:
+
+- Git commit or source archive/version used.
+- `processing_run_id` for QC, opportunity, matching, measurement and aggregation.
+- Product ID, platform, collection and source mode.
+- Requested UTC date range, bbox, temporal window, matching method and grid resolution.
+- Raw asset IDs, granule IDs and SHA-256 checksums.
+- QC statuses/warnings, opportunity evidence source/state and `beta_ret` when supported.
+- Geometry source and whether timestamps are interpolated or granule-start-only.
+- Export file names and checksums.
+
+Never share `.env`, Earthdata tokens, FIRMS keys or database passwords as part of the validation record.
+
+### A13. Interpreting warnings during tests
+
+A test suite may print third-party deprecation warnings (for example from Starlette/httpx or Shapely). These warnings are not test failures by themselves. The decisive result is the final unittest summary (`OK` versus `FAILED`). Do not suppress application warnings that describe missing scientific evidence, failed HDF4 SDS reads, incomplete geolocation or out-of-range platform dates.
