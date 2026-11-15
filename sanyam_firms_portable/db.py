@@ -168,7 +168,10 @@ processing_runs = Table(
     Column("output_count", Integer, nullable=False, server_default=text("0")),
     Column("status", String(24), nullable=False),
     Column("error_message", Text, nullable=True),
-    CheckConstraint("module_name IN ('QC', 'OPPORTUNITY')", name="ck_processing_runs_module"),
+    CheckConstraint(
+        "module_name IN ('QC', 'OPPORTUNITY', 'MATCHING', 'MEASUREMENT', 'AGGREGATION')",
+        name="ck_processing_runs_module",
+    ),
 )
 idx_processing_runs_module_method = Index(
     "idx_processing_runs_module_method",
@@ -236,6 +239,103 @@ idx_opportunities_lookup = Index(
     observation_opportunities.c.spatial_unit_id,
     observation_opportunities.c.time_window_start,
     observation_opportunities.c.time_window_end,
+)
+
+# SKH §§6.10 and 7.2–7.7 — Module 6 scientific outputs.
+candidate_associations = Table(
+    "candidate_associations",
+    metadata,
+    Column("candidate_id", Integer, Identity(), primary_key=True),
+    Column("processing_run_id", Integer, ForeignKey("processing_runs.processing_run_id", ondelete="RESTRICT"), nullable=False),
+    # One side is NULL for an explicit UNMATCHED node record.
+    Column("modis_observation_id", Integer, ForeignKey("observations.observation_id", ondelete="RESTRICT"), nullable=True),
+    Column("viirs_observation_id", Integer, ForeignKey("observations.observation_id", ondelete="RESTRICT"), nullable=True),
+    Column("matching_method", String(32), nullable=False),
+    Column("time_difference_minutes", Float, nullable=True),
+    Column("centroid_distance_km", Float, nullable=True),
+    Column("intersection_area_km2", Float, nullable=True),
+    Column("iou", Float, nullable=True),
+    Column("smaller_footprint_overlap", Float, nullable=True),
+    Column("boundary_distance_km", Float, nullable=True),
+    Column("geometry_source", String(48), nullable=True),
+    Column("relationship_status", String(32), nullable=False),
+    Column("modis_degree", Integer, nullable=True),
+    Column("viirs_degree", Integer, nullable=True),
+    Column("component_id", String(64), nullable=True),
+    Column("config_json", Text, nullable=False),
+    UniqueConstraint(
+        "processing_run_id", "matching_method", "modis_observation_id", "viirs_observation_id",
+        name="uq_candidate_run_method_pair",
+    ),
+    CheckConstraint(
+        "matching_method IN ('BASELINE_HAVERSINE', 'FOOTPRINT_AWARE')",
+        name="ck_candidate_matching_method",
+    ),
+    CheckConstraint(
+        "relationship_status IN ('SINGLE_CANDIDATE', 'MULTIPLE_CANDIDATES', 'AMBIGUOUS_GROUP', 'UNMATCHED', 'REJECTED')",
+        name="ck_candidate_relationship_status",
+    ),
+    CheckConstraint(
+        "modis_observation_id IS NOT NULL OR viirs_observation_id IS NOT NULL",
+        name="ck_candidate_has_observation",
+    ),
+)
+idx_candidate_run = Index("idx_candidate_run", candidate_associations.c.processing_run_id)
+idx_candidate_modis = Index("idx_candidate_modis", candidate_associations.c.modis_observation_id)
+idx_candidate_viirs = Index("idx_candidate_viirs", candidate_associations.c.viirs_observation_id)
+
+measurement_results = Table(
+    "measurement_results",
+    metadata,
+    Column("measurement_result_id", Integer, Identity(), primary_key=True),
+    Column("processing_run_id", Integer, ForeignKey("processing_runs.processing_run_id", ondelete="RESTRICT"), nullable=False),
+    Column("observation_id", Integer, ForeignKey("observations.observation_id", ondelete="RESTRICT"), nullable=False),
+    Column("frp_raw_mw", Float, nullable=True),
+    Column("frp_adjusted_mw", Float, nullable=True),
+    Column("adjustment_method", String(96), nullable=True),
+    Column("method_version", String(64), nullable=False),
+    Column("detection_limit_mw", Float, nullable=True),
+    Column("pixel_area_km2", Float, nullable=True),
+    Column("evidence_category", String(40), nullable=False),
+    Column("created_at", UTCDateTime(), nullable=False),
+    UniqueConstraint("processing_run_id", "observation_id", name="uq_measurement_run_observation"),
+    CheckConstraint(
+        "evidence_category IN ('DIRECT_SOURCE_OBSERVATION', 'MODEL_ADJUSTED')",
+        name="ck_measurement_evidence_category",
+    ),
+)
+idx_measurement_run = Index("idx_measurement_run", measurement_results.c.processing_run_id)
+idx_measurement_observation = Index("idx_measurement_observation", measurement_results.c.observation_id)
+
+aggregation_results = Table(
+    "aggregation_results",
+    metadata,
+    Column("agg_id", Integer, Identity(), primary_key=True),
+    Column("processing_run_id", Integer, ForeignKey("processing_runs.processing_run_id", ondelete="RESTRICT"), nullable=False),
+    Column("grid_cell_id", String(128), nullable=False),
+    Column("grid_resolution_km", Float, nullable=False),
+    # RFC 7946 export geometry is WGS84 longitude/latitude WKT. Area calculations
+    # are performed in the equal-area CRS recorded in processing_runs.configuration_json.
+    Column("cell_geometry_wkt", Text, nullable=False),
+    Column("period_start", UTCDateTime(), nullable=False),
+    Column("period_end", UTCDateTime(), nullable=False),
+    Column("modis_count", Float, nullable=False, server_default=text("0")),
+    Column("viirs_count", Float, nullable=False, server_default=text("0")),
+    Column("matched_group_count", Integer, nullable=True),
+    Column("modis_frp_sum_mw", Float, nullable=True),
+    Column("viirs_frp_sum_mw", Float, nullable=True),
+    Column("valid_area_fraction", Float, nullable=True),
+    Column("opportunity_summary", Text, nullable=False),
+    Column("activity_status", String(32), nullable=False),
+    Column("created_at", UTCDateTime(), nullable=False),
+    UniqueConstraint("processing_run_id", "grid_cell_id", "period_start", "period_end", name="uq_aggregation_run_cell_period"),
+    CheckConstraint("grid_resolution_km > 0", name="ck_aggregation_grid_resolution"),
+    CheckConstraint("period_end > period_start", name="ck_aggregation_period"),
+)
+idx_aggregation_run = Index("idx_aggregation_run", aggregation_results.c.processing_run_id)
+idx_aggregation_grid_period = Index(
+    "idx_aggregation_grid_period", aggregation_results.c.grid_cell_id,
+    aggregation_results.c.period_start, aggregation_results.c.period_end,
 )
 
 
@@ -407,6 +507,74 @@ def _backfill_raw_assets(engine: Engine) -> None:
             connection.execute(raw_assets.insert(), payload)
 
 
+def _migrate_processing_run_modules(engine: Engine) -> None:
+    """Expand processing_runs module names while preserving existing rows/FKs."""
+    if "processing_runs" not in inspect(engine).get_table_names():
+        return
+    allowed = "'QC', 'OPPORTUNITY', 'MATCHING', 'MEASUREMENT', 'AGGREGATION'"
+    if engine.dialect.name == "postgresql":
+        with engine.connect() as connection:
+            definition = connection.execute(text("""
+                SELECT pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conrelid = 'processing_runs'::regclass
+                  AND conname = 'ck_processing_runs_module'
+            """)).scalar_one_or_none()
+        if definition and "MATCHING" in definition and "AGGREGATION" in definition:
+            return
+        with engine.begin() as connection:
+            connection.execute(text(
+                "ALTER TABLE processing_runs DROP CONSTRAINT IF EXISTS ck_processing_runs_module"
+            ))
+            connection.execute(text(
+                f"ALTER TABLE processing_runs ADD CONSTRAINT ck_processing_runs_module "
+                f"CHECK (module_name IN ({allowed}))"
+            ))
+        return
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.commit()
+        try:
+            with connection.begin():
+                schema = connection.exec_driver_sql(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='processing_runs'"
+                ).scalar_one_or_none() or ""
+                if "'MATCHING'" in schema and "'AGGREGATION'" in schema:
+                    return
+                connection.exec_driver_sql("""
+                    CREATE TABLE processing_runs_new (
+                        processing_run_id INTEGER NOT NULL PRIMARY KEY,
+                        module_name VARCHAR(24) NOT NULL,
+                        method_version VARCHAR(64) NOT NULL,
+                        configuration_json TEXT NOT NULL,
+                        started_at DATETIME NOT NULL,
+                        completed_at DATETIME,
+                        input_count INTEGER NOT NULL DEFAULT 0,
+                        output_count INTEGER NOT NULL DEFAULT 0,
+                        status VARCHAR(24) NOT NULL,
+                        error_message TEXT,
+                        CONSTRAINT ck_processing_runs_module
+                        CHECK (module_name IN ('QC','OPPORTUNITY','MATCHING','MEASUREMENT','AGGREGATION'))
+                    )
+                """)
+                connection.exec_driver_sql("""
+                    INSERT INTO processing_runs_new (
+                        processing_run_id, module_name, method_version, configuration_json,
+                        started_at, completed_at, input_count, output_count, status, error_message
+                    )
+                    SELECT processing_run_id, module_name, method_version, configuration_json,
+                           started_at, completed_at, input_count, output_count, status, error_message
+                    FROM processing_runs
+                """)
+                connection.exec_driver_sql("DROP TABLE processing_runs")
+                connection.exec_driver_sql("ALTER TABLE processing_runs_new RENAME TO processing_runs")
+        finally:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            connection.commit()
+
+
 class DatabaseRepository:
     """Dialect-aware persistence repository for the FIRMS ingestion pipeline."""
 
@@ -566,8 +734,8 @@ class DatabaseRepository:
         method_version: str,
         configuration_json: str,
     ) -> int:
-        if module_name not in {"QC", "OPPORTUNITY"}:
-            raise ValueError("module_name must be 'QC' or 'OPPORTUNITY'")
+        if module_name not in {"QC", "OPPORTUNITY", "MATCHING", "MEASUREMENT", "AGGREGATION"}:
+            raise ValueError("unsupported processing module_name")
         statement = (
             processing_runs.insert()
             .values(
@@ -773,6 +941,207 @@ class DatabaseRepository:
             rows = connection.execute(statement).all()
         return {row.opportunity_state: int(row.record_count) for row in rows}
 
+    def fetch_scientific_observations(
+        self,
+        *,
+        sensors: Iterable[str] | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        west: float | None = None,
+        south: float | None = None,
+        east: float | None = None,
+        north: float | None = None,
+        qc_processing_run_id: int | None = None,
+        require_matching_suitability: bool = True,
+        require_frp_suitability: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Fetch observations with a completed QC result; no source rows are mutated."""
+        qc_subquery = (
+            select(func.max(qc_results.c.qc_result_id))
+            .select_from(qc_results.join(
+                processing_runs,
+                qc_results.c.processing_run_id == processing_runs.c.processing_run_id,
+            ))
+            .where(
+                qc_results.c.observation_id == observations.c.observation_id,
+                processing_runs.c.module_name == "QC",
+                processing_runs.c.status == "COMPLETED",
+            )
+        )
+        if qc_processing_run_id is not None:
+            qc_subquery = qc_subquery.where(qc_results.c.processing_run_id == qc_processing_run_id)
+        latest_qc_id = qc_subquery.correlate(observations).scalar_subquery()
+        qc_join_condition = qc_results.c.qc_result_id == latest_qc_id
+        selected = [observations.c[name] for name in observations.c.keys()]
+        selected.extend([
+            qc_results.c.qc_result_id.label("qc_result_id"),
+            qc_results.c.processing_run_id.label("qc_processing_run_id"),
+            qc_results.c.quality_status.label("qc_quality_status"),
+            qc_results.c.suitability_for_matching.label("suitability_for_matching"),
+            qc_results.c.suitability_for_frp.label("suitability_for_frp"),
+            qc_results.c.warnings_json.label("qc_warnings_json"),
+            qc_results.c.source_confidence_category.label("source_confidence_category"),
+        ])
+        statement = select(*selected).select_from(
+            observations.join(qc_results, qc_join_condition)
+        )
+        if sensors:
+            sensor_values = [str(value).upper() for value in sensors]
+            statement = statement.where(observations.c.sensor.in_(sensor_values))
+        if start_at is not None:
+            statement = statement.where(observations.c.acquired_at >= start_at)
+        if end_at is not None:
+            statement = statement.where(observations.c.acquired_at < end_at)
+        if west is not None:
+            statement = statement.where(observations.c.longitude >= west)
+        if east is not None:
+            statement = statement.where(observations.c.longitude <= east)
+        if south is not None:
+            statement = statement.where(observations.c.latitude >= south)
+        if north is not None:
+            statement = statement.where(observations.c.latitude <= north)
+        if require_matching_suitability:
+            statement = statement.where(qc_results.c.suitability_for_matching.is_(True))
+        if require_frp_suitability:
+            statement = statement.where(qc_results.c.suitability_for_frp.is_(True))
+        statement = statement.order_by(observations.c.acquired_at, observations.c.observation_id)
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def fetch_observations_by_ids(self, observation_ids: Iterable[int]) -> list[dict[str, Any]]:
+        ids = sorted({int(value) for value in observation_ids})
+        if not ids:
+            return []
+        latest_qc_id = (
+            select(func.max(qc_results.c.qc_result_id))
+            .select_from(qc_results.join(
+                processing_runs,
+                qc_results.c.processing_run_id == processing_runs.c.processing_run_id,
+            ))
+            .where(
+                qc_results.c.observation_id == observations.c.observation_id,
+                processing_runs.c.module_name == "QC",
+                processing_runs.c.status == "COMPLETED",
+            )
+            .correlate(observations)
+            .scalar_subquery()
+        )
+        selected = [observations.c[name] for name in observations.c.keys()]
+        selected.extend([
+            qc_results.c.quality_status.label("qc_quality_status"),
+            qc_results.c.suitability_for_matching.label("suitability_for_matching"),
+            qc_results.c.suitability_for_frp.label("suitability_for_frp"),
+        ])
+        statement = (
+            select(*selected)
+            .select_from(observations.outerjoin(qc_results, qc_results.c.qc_result_id == latest_qc_id))
+            .where(observations.c.observation_id.in_(ids))
+            .order_by(observations.c.observation_id)
+        )
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def insert_candidate_associations(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        payload = [dict(row) for row in rows]
+        if not payload:
+            return 0
+        # candidate_associations is an evidence edge table; its timestamps are
+        # represented by the linked processing_runs row, so it has no created_at.
+        inserted = 0
+        with self.engine.begin() as connection:
+            for offset in range(0, len(payload), INSERT_BATCH_SIZE):
+                batch = payload[offset:offset + INSERT_BATCH_SIZE]
+                if self.dialect_name == "sqlite":
+                    statement = sqlite_insert(candidate_associations).values(batch)
+                elif self.dialect_name == "postgresql":
+                    statement = postgresql_insert(candidate_associations).values(batch)
+                else:
+                    raise RuntimeError(f"Unsupported database dialect: {self.dialect_name}")
+                statement = statement.on_conflict_do_nothing(
+                    index_elements=[
+                        candidate_associations.c.processing_run_id,
+                        candidate_associations.c.matching_method,
+                        candidate_associations.c.modis_observation_id,
+                        candidate_associations.c.viirs_observation_id,
+                    ]
+                ).returning(candidate_associations.c.candidate_id)
+                inserted += len(connection.execute(statement).scalars().all())
+        return inserted
+
+    def fetch_candidate_associations(self, processing_run_id: int) -> list[dict[str, Any]]:
+        statement = (
+            select(candidate_associations)
+            .where(candidate_associations.c.processing_run_id == processing_run_id)
+            .order_by(candidate_associations.c.candidate_id)
+        )
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def insert_measurement_results(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        payload = [dict(row) for row in rows]
+        if not payload:
+            return 0
+        now = datetime.now(timezone.utc)
+        for row in payload:
+            row.setdefault("created_at", now)
+        with self.engine.begin() as connection:
+            for offset in range(0, len(payload), INSERT_BATCH_SIZE):
+                connection.execute(measurement_results.insert(), payload[offset:offset + INSERT_BATCH_SIZE])
+        return len(payload)
+
+    def fetch_measurement_results(self, processing_run_id: int) -> list[dict[str, Any]]:
+        statement = select(measurement_results).where(
+            measurement_results.c.processing_run_id == processing_run_id
+        ).order_by(measurement_results.c.measurement_result_id)
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def insert_aggregation_results(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        """Insert aggregation rows in bounded batches without materializing all input."""
+        inserted = 0
+        batch: list[dict[str, Any]] = []
+        with self.engine.begin() as connection:
+            for item in rows:
+                row = dict(item)
+                row.setdefault("created_at", datetime.now(timezone.utc))
+                batch.append(row)
+                if len(batch) >= INSERT_BATCH_SIZE:
+                    connection.execute(aggregation_results.insert(), batch)
+                    inserted += len(batch)
+                    batch.clear()
+            if batch:
+                connection.execute(aggregation_results.insert(), batch)
+                inserted += len(batch)
+        return inserted
+
+    def fetch_aggregation_results(self, processing_run_id: int) -> list[dict[str, Any]]:
+        statement = select(aggregation_results).where(
+            aggregation_results.c.processing_run_id == processing_run_id
+        ).order_by(aggregation_results.c.period_start, aggregation_results.c.grid_cell_id)
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def list_processing_runs(
+        self, *, limit: int = 20, module_name: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List recent processing runs, useful for recovering IDs after CLI runs."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        statement = select(processing_runs)
+        if module_name is not None:
+            statement = statement.where(processing_runs.c.module_name == module_name)
+        statement = statement.order_by(processing_runs.c.processing_run_id.desc()).limit(limit)
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(statement).mappings().all()]
+
+    def get_processing_run(self, processing_run_id: int) -> dict[str, Any] | None:
+        statement = select(processing_runs).where(
+            processing_runs.c.processing_run_id == processing_run_id
+        )
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().first()
+            return dict(row) if row else None
+
     def count_observations(self) -> int:
         from sqlalchemy import func
         with self.engine.connect() as connection:
@@ -813,7 +1182,12 @@ def connect_db(database_url: str | Path | None = None) -> DatabaseRepository:
         else:
             _migrate_additive_observation_columns(engine)
         _migrate_postgresql_timestamp_columns(engine)
-        metadata.create_all(engine, tables=[processing_runs, qc_results, observation_opportunities])
+        metadata.create_all(engine, tables=[processing_runs])
+        _migrate_processing_run_modules(engine)
+        metadata.create_all(engine, tables=[
+            qc_results, observation_opportunities, candidate_associations,
+            measurement_results, aggregation_results,
+        ])
         for index in (
             idx_observations_acquired_at,
             idx_observations_dataset_time,
@@ -825,6 +1199,13 @@ def connect_db(database_url: str | Path | None = None) -> DatabaseRepository:
             idx_qc_results_observation,
             idx_qc_results_run,
             idx_opportunities_lookup,
+            idx_candidate_run,
+            idx_candidate_modis,
+            idx_candidate_viirs,
+            idx_measurement_run,
+            idx_measurement_observation,
+            idx_aggregation_run,
+            idx_aggregation_grid_period,
         ):
             index.create(engine, checkfirst=True)
         _backfill_raw_assets(engine)
